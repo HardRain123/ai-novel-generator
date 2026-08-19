@@ -1,0 +1,83 @@
+:root {
+  --ink: #20252b;
+  --muted: #7b8490;
+  --line: #e8e4dc;
+  --paper: #fffdf8;
+  --canvas: #f6f4ef;
+  --accent: #bd5b39;
+  --accent-light: #faece5;
+  --green: #3e7a5e;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; color: var(--ink); background: var(--canvas); font-family: "Noto Sans SC", "PingFang SC", system-ui, sans-serif; }
+button, input, textarea, select { font: inherit; }
+button { cursor: pointer; }
+.shell { min-height: 100vh; display: grid; grid-template-columns: 275px minmax(0, 1fr); }
+.sidebar { background: #252b30; color: #f8f5ee; padding: 28px 20px; }
+.brand { font-family: Georgia, serif; font-size: 25px; letter-spacing: .05em; margin: 0; }
+.brand-note { color: #aab0b4; font-size: 12px; margin: 8px 0 28px; }
+.side-label { color: #8f989e; font-size: 11px; letter-spacing: .12em; text-transform: uppercase; margin: 22px 8px 10px; }
+.work-list { display: grid; gap: 6px; }
+.work-item { border: 0; background: transparent; color: #dfe1dd; text-align: left; border-radius: 9px; padding: 11px 10px; width: 100%; }
+.work-item:hover, .work-item.active { background: #3b4248; color: white; }
+.work-item strong { display: block; font-size: 14px; font-weight: 600; }
+.work-item span { display: block; color: #929ba1; font-size: 11px; margin-top: 4px; }
+.empty-side { color: #8f989e; font-size: 13px; line-height: 1.6; padding: 10px 8px; }
+.main { padding: 34px 42px 56px; max-width: 1440px; width: 100%; margin: 0 auto; }
+.topbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; margin-bottom: 28px; }
+.eyebrow { color: var(--accent); font-size: 12px; letter-spacing: .16em; font-weight: 700; }
+h1 { font-family: Georgia, "Songti SC", serif; font-size: clamp(28px, 4vw, 44px); line-height: 1.12; margin: 8px 0 10px; letter-spacing: -.03em; }
+h2 { font-family: Georgia, "Songti SC", serif; font-size: 24px; margin: 0 0 6px; }
+h3 { font-size: 15px; margin: 0 0 10px; }
+.subtitle { color: var(--muted); margin: 0; font-size: 14px; }
+.top-actions { display: flex; gap: 9px; flex-wrap: wrap; justify-content: flex-end; }
+.button { border: 1px solid var(--line); background: var(--paper); color: var(--ink); padding: 10px 14px; border-radius: 8px; font-size: 13px; }
+.button:hover { border-color: #c8b7a9; }
+.button.primary { color: white; background: var(--accent); border-color: var(--accent); }
+.button.dark { color: white; background: #30383e; border-color: #30383e; }
+.button:disabled { opacity: .5; cursor: not-allowed; }
+.notice { background: var(--accent-light); color: #7b412d; border: 1px solid #f0d3c5; padding: 12px 15px; border-radius: 9px; font-size: 13px; margin-bottom: 20px; }
+.grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
+.card { background: var(--paper); border: 1px solid var(--line); border-radius: 14px; padding: 20px; box-shadow: 0 5px 18px rgba(54, 44, 30, .035); }
+.span-4 { grid-column: span 4; }
+.span-5 { grid-column: span 5; }
+.span-7 { grid-column: span 7; }
+.span-8 { grid-column: span 8; }
+.span-12 { grid-column: span 12; }
+.stat { min-height: 116px; }
+.stat-label { color: var(--muted); font-size: 12px; }
+.stat-value { display: block; font-family: Georgia, serif; font-size: 29px; margin-top: 14px; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: 26px 0 20px; }
+.tab { background: transparent; border: 0; color: var(--muted); padding: 10px 14px; border-bottom: 2px solid transparent; }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 700; }
+.field { display: grid; gap: 6px; margin-bottom: 14px; }
+.field label { color: #67717b; font-size: 12px; }
+.field input, .field textarea, .field select { border: 1px solid var(--line); background: #fffefa; border-radius: 8px; padding: 10px 11px; color: var(--ink); outline: none; }
+.field textarea { min-height: 86px; resize: vertical; line-height: 1.7; }
+.field input:focus, .field textarea:focus, .field select:focus { border-color: #c98a72; box-shadow: 0 0 0 3px #f5e2d9; }
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 15px; }
+.toolbar-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.chapter-list { display: grid; gap: 7px; max-height: 420px; overflow: auto; }
+.chapter-row { display: flex; align-items: center; justify-content: space-between; text-align: left; width: 100%; background: #fffefa; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; color: var(--ink); }
+.chapter-row.active { border-color: var(--accent); background: var(--accent-light); }
+.chapter-row small { color: var(--muted); }
+.chapter-content { min-height: 450px !important; font-family: "Songti SC", Georgia, serif; font-size: 16px; line-height: 2; background: #fffefa; }
+.outline { display: grid; gap: 12px; }
+.outline-item { border-left: 3px solid #d9b29e; padding: 5px 0 5px 14px; }
+.outline-item strong { font-size: 14px; }
+.outline-item p { color: #59636b; font-size: 13px; line-height: 1.6; margin: 6px 0 0; }
+.tag { display: inline-block; color: var(--green); background: #e9f3ed; padding: 3px 7px; border-radius: 99px; font-size: 11px; margin-left: 6px; }
+.issue { border: 1px solid #ecd4c9; background: #fff9f6; border-radius: 9px; padding: 10px 12px; margin-top: 9px; }
+.issue strong { color: #985139; font-size: 13px; }
+.issue p { color: #6e6965; font-size: 12px; margin: 5px 0 0; line-height: 1.6; }
+.score { font-family: Georgia, serif; font-size: 40px; color: var(--green); }
+.asset-list { display: grid; gap: 10px; }
+.asset { border: 1px solid var(--line); border-radius: 9px; padding: 12px; }
+.asset strong { font-size: 14px; }
+.asset p { color: #636d74; font-size: 13px; line-height: 1.6; margin: 6px 0 0; }
+.muted { color: var(--muted); font-size: 13px; }
+.loading { color: var(--muted); padding: 60px 0; text-align: center; }
+@media (max-width: 900px) { .shell { grid-template-columns: 1fr; } .sidebar { padding: 18px; } .work-list { display: flex; overflow: auto; } .work-item { min-width: 170px; } .main { padding: 24px 18px 40px; } .span-4, .span-5, .span-7, .span-8 { grid-column: span 12; } .topbar { display: block; } .top-actions { justify-content: flex-start; margin-top: 18px; } }
+
