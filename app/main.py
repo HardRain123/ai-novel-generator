@@ -1,19 +1,34 @@
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import WEB_ORIGIN
+from app.config import LLM_API_KEY, WEB_ORIGIN
 from app.db import init_db, transaction
 from app.schemas import (
     ChapterUpdate,
     GenerateChapterRequest,
     GenerateOutlineRequest,
+    GenerationJobCreate,
     StoryBibleUpdate,
+    StateReviewRequest,
     WorkCreate,
     WorkUpdate,
+    CreateFromTrendIdeaRequest,
+    ForeshadowCreate,
+    ForeshadowUpdate,
+    ModelProfileCreate,
+    ModelProfileUpdate,
+    TrendAnalyzeRequest,
+    TrendSearchRequest,
 )
 from app.services.novel_engine import engine
+from app.services.quality import quality_check as run_quality_check
+from app.services.generation_jobs import cancel_job, enqueue_job, get_job, list_jobs, retry_job
+from app.services.foreshadows import create_foreshadow, delete_foreshadow, foreshadow_stats, list_foreshadows, update_foreshadow
+from app.services.model_profiles import bootstrap_legacy_profile, create_profile, delete_profile, fetch_models, get_profile, list_profiles, preset, test_profile, update_profile
+from app.services.trends import SOURCE_CONFIG, analyze_trends, get_analysis, search_trends
 from app.services.repository import (
     create_work,
     get_work,
@@ -24,11 +39,18 @@ from app.services.repository import (
     save_story_setup,
     update_work,
 )
-from app.services.state_extraction import extract_and_persist, get_extraction, list_extractions
+from app.services.state_extraction import extract_and_persist, get_extraction, list_extractions, review_extraction
 from app.utils import json_dumps, now_iso
 
 
-app = FastAPI(title="AI 长篇小说生成器", version="0.1.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    init_db()
+    bootstrap_legacy_profile()
+    yield
+
+
+app = FastAPI(title="AI 长篇小说生成器", version="0.2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[WEB_ORIGIN, "http://localhost:3000"],
@@ -36,11 +58,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def startup():
-    init_db()
 
 
 def _work_or_404(work_id: str) -> dict[str, Any]:
@@ -59,35 +76,113 @@ def _record_generation(conn, work_id: str, kind: str, input_data: dict, output_d
     )
 
 
-def _quality_check(work: dict[str, Any], chapter_no: int, content: str) -> tuple[list[dict[str, Any]], int]:
-    issues: list[dict[str, Any]] = []
-    text = content.strip()
-    if not text:
-        issues.append({"kind": "empty", "severity": "high", "message": "章节正文为空。", "suggestion": "先生成正文或补充本章场景。"})
-    if len(text) < 180 and text:
-        issues.append({"kind": "length", "severity": "low", "message": "本章内容较短，可能还没有完成完整的场景推进。", "evidence": f"当前约 {len(text)} 字。", "suggestion": "补充一个具体场景、阻力和结尾钩子。"})
-
-    sentences = [line.strip() for line in text.replace("。", "。\n").splitlines() if line.strip()]
-    repeated = [line for index, line in enumerate(sentences[1:], start=1) if line == sentences[index - 1]]
-    if repeated:
-        issues.append({"kind": "repetition", "severity": "medium", "message": "发现连续重复的句子。", "evidence": repeated[0][:100], "suggestion": "删除重复句或改成新的动作推进。"})
-
-    names = [str(item.get("name")) for item in work.get("characters", []) if item.get("name")]
-    if names and text and not any(name in text for name in names):
-        issues.append({"kind": "character", "severity": "medium", "message": "本章没有检测到故事档案中的人物名称。", "suggestion": "确认是否写成了无人物主体的过渡段，或补充人物动作和对白。"})
-
-    for item in work.get("foreshadows", []):
-        expected = int(item.get("expected_reveal_chapter") or 0)
-        if expected and expected <= chapter_no and item.get("status") == "open":
-            issues.append({"kind": "foreshadow", "severity": "medium", "message": f"伏笔“{item.get('clue', '')}”预计在本章前回收，但仍处于未回收状态。", "suggestion": "确认本章是否需要回收，或调整预计回收章节。"})
-
-    penalty = sum({"low": 5, "medium": 12, "high": 35}.get(issue["severity"], 0) for issue in issues)
-    return issues, max(0, 100 - penalty)
-
-
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "ai-novel-generator"}
+    configured = bool(LLM_API_KEY or any(item.get("has_api_key") or (item.get("provider") == "codex_auth" and item.get("last_test_status") == "ok") for item in list_profiles()))
+    return {"status": "ok", "service": "ai-novel-generator", "mode": "live" if configured else "demo", "model_configured": configured}
+
+
+@app.get("/api/model-profiles")
+def model_profiles():
+    return {"items": list_profiles(), "presets": {key: preset(key) for key in ("deepseek", "qwen", "kimi", "custom", "codex_auth")}}
+
+
+@app.post("/api/model-profiles")
+def create_model_profile(payload: ModelProfileCreate):
+    try:
+        return create_profile(payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/model-profiles/{profile_id}")
+def model_profile_detail(profile_id: str):
+    profile = get_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="模型配置不存在")
+    return profile
+
+
+@app.patch("/api/model-profiles/{profile_id}")
+def patch_model_profile(profile_id: str, payload: ModelProfileUpdate):
+    try:
+        profile = update_profile(profile_id, payload.model_dump(exclude_unset=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not profile:
+        raise HTTPException(status_code=404, detail="模型配置不存在")
+    return profile
+
+
+@app.delete("/api/model-profiles/{profile_id}")
+def remove_model_profile(profile_id: str):
+    if not delete_profile(profile_id):
+        raise HTTPException(status_code=404, detail="模型配置不存在")
+    return {"ok": True}
+
+
+@app.post("/api/model-profiles/{profile_id}/test")
+def test_model_profile(profile_id: str):
+    try:
+        return test_profile(profile_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/model-profiles/{profile_id}/models")
+def model_profile_models(profile_id: str):
+    try:
+        return {"items": fetch_models(profile_id)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/works/{work_id}/generation-jobs", status_code=202)
+def create_generation_job(work_id: str, payload: GenerationJobCreate):
+    _work_or_404(work_id)
+    try:
+        return enqueue_job(work_id, payload.kind, payload.payload, payload.idempotency_key, payload.model_profile_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/works/{work_id}/generation-jobs/{job_id}")
+def generation_job_detail(work_id: str, job_id: str):
+    _work_or_404(work_id)
+    job = get_job(job_id, work_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="生成任务不存在")
+    return job
+
+
+@app.get("/api/works/{work_id}/generation-jobs")
+def generation_jobs(work_id: str, active: bool = False):
+    _work_or_404(work_id)
+    return {"items": list_jobs(work_id, active)}
+
+
+@app.post("/api/works/{work_id}/generation-jobs/{job_id}/cancel")
+def cancel_generation_job(work_id: str, job_id: str):
+    _work_or_404(work_id)
+    try:
+        job = cancel_job(job_id, work_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not job:
+        raise HTTPException(status_code=404, detail="生成任务不存在")
+    return job
+
+
+@app.post("/api/works/{work_id}/generation-jobs/{job_id}/retry")
+def retry_generation_job(work_id: str, job_id: str):
+    _work_or_404(work_id)
+    try:
+        job = retry_job(job_id, work_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not job:
+        raise HTTPException(status_code=404, detail="生成任务不存在")
+    return job
 
 
 @app.get("/api/works")
@@ -100,14 +195,93 @@ def create(payload: WorkCreate):
     return create_work(payload.model_dump())
 
 
+@app.get("/api/trends/sources")
+def trend_sources():
+    return {"items": [{"id": key, **value} for key, value in SOURCE_CONFIG.items()]}
+
+
+@app.post("/api/trends/search")
+def trend_search(payload: TrendSearchRequest):
+    return search_trends(payload.sources, payload.category, payload.board, payload.keyword, payload.refresh)
+
+
+@app.post("/api/trends/analyze")
+def trend_analyze(payload: TrendAnalyzeRequest):
+    try:
+        return analyze_trends(payload.item_ids, payload.model_profile_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/trends/analyses/{analysis_id}")
+def trend_analysis_detail(analysis_id: str):
+    result = get_analysis(analysis_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="趋势分析不存在")
+    return result
+
+
+@app.post("/api/works/from-trend-idea")
+def create_work_from_trend(payload: CreateFromTrendIdeaRequest):
+    analysis = get_analysis(payload.analysis_id)
+    if not analysis:
+        raise HTTPException(status_code=404, detail="趋势分析不存在")
+    ideas = analysis.get("ideas") or []
+    if payload.idea_index >= len(ideas):
+        raise HTTPException(status_code=422, detail="创意不存在")
+    idea = ideas[payload.idea_index]
+    work = create_work({
+        "title": idea.get("title", "未命名作品"),
+        "genre": idea.get("genre", ""),
+        "target_audience": idea.get("audience", ""),
+        "premise": idea.get("premise", ""),
+        "model_profile_id": payload.model_profile_id,
+    })
+    import uuid
+    with transaction() as conn:
+        for item in analysis.get("items", []):
+            conn.execute("INSERT INTO work_inspirations(id,work_id,analysis_id,source,title,source_url,created_at) VALUES (?,?,?,?,?,?,?)", (str(uuid.uuid4()), work["id"], payload.analysis_id, item.get("source", ""), item.get("title", ""), item.get("source_url", ""), now_iso()))
+    return work
+
+
 @app.get("/api/works/{work_id}")
 def work_detail(work_id: str):
     return _work_or_404(work_id)
 
 
+@app.get("/api/works/{work_id}/foreshadows")
+def work_foreshadows(work_id: str, status: str | None = None):
+    work = _work_or_404(work_id)
+    current_chapter = max((int(item.get("chapter_no") or 0) for item in work.get("chapters", [])), default=0) + 1
+    return {"items": list_foreshadows(work_id, status), "stats": foreshadow_stats(work_id, current_chapter)}
+
+
+@app.post("/api/works/{work_id}/foreshadows")
+def add_work_foreshadow(work_id: str, payload: ForeshadowCreate):
+    _work_or_404(work_id)
+    return create_foreshadow(work_id, payload.model_dump())
+
+
+@app.patch("/api/works/{work_id}/foreshadows/{item_id}")
+def patch_work_foreshadow(work_id: str, item_id: str, payload: ForeshadowUpdate):
+    _work_or_404(work_id)
+    item = update_foreshadow(work_id, item_id, payload.model_dump(exclude_unset=True))
+    if not item:
+        raise HTTPException(status_code=404, detail="伏笔不存在")
+    return item
+
+
+@app.delete("/api/works/{work_id}/foreshadows/{item_id}")
+def remove_work_foreshadow(work_id: str, item_id: str):
+    _work_or_404(work_id)
+    if not delete_foreshadow(work_id, item_id):
+        raise HTTPException(status_code=404, detail="伏笔不存在")
+    return {"ok": True}
+
+
 @app.patch("/api/works/{work_id}")
 def work_update(work_id: str, payload: WorkUpdate):
-    updated = update_work(work_id, payload.model_dump())
+    updated = update_work(work_id, payload.model_dump(exclude_unset=True))
     if not updated:
         raise HTTPException(status_code=404, detail="作品不存在")
     return updated
@@ -157,7 +331,7 @@ def generate_outline(work_id: str, payload: GenerateOutlineRequest):
 def generate_chapter(work_id: str, payload: GenerateChapterRequest):
     work = _work_or_404(work_id)
     data = engine.generate_chapter(work, payload.chapter_no, payload.mode, payload.instruction)
-    issues, score = _quality_check({**work, "chapters": [*work.get("chapters", []), data]}, payload.chapter_no, data.get("content", ""))
+    issues, score = run_quality_check({**work, "chapters": [*work.get("chapters", []), data]}, payload.chapter_no, data.get("content", ""))
     with transaction() as conn:
         save_chapter(conn, work_id, {**data, "status": "draft"})
         save_quality_report(conn, work_id, payload.chapter_no, issues, score)
@@ -179,7 +353,7 @@ def update_chapter(work_id: str, chapter_no: int, payload: ChapterUpdate):
         "content": payload.content if payload.content is not None else current.get("content", ""),
         "status": payload.status if payload.status is not None else current.get("status", "draft"),
     }
-    issues, score = _quality_check(work, chapter_no, data["content"])
+    issues, score = run_quality_check(work, chapter_no, data["content"])
     with transaction() as conn:
         save_chapter(conn, work_id, data)
         save_quality_report(conn, work_id, chapter_no, issues, score)
@@ -196,7 +370,7 @@ def quality_check(work_id: str, chapter_no: int):
     chapter = next((item for item in work.get("chapters", []) if item.get("chapter_no") == chapter_no), None)
     if not chapter:
         raise HTTPException(status_code=404, detail="章节不存在")
-    issues, score = _quality_check(work, chapter_no, chapter.get("content", ""))
+    issues, score = run_quality_check(work, chapter_no, chapter.get("content", ""))
     with transaction() as conn:
         save_quality_report(conn, work_id, chapter_no, issues, score)
     return {"score": score, "issues": issues}
@@ -223,4 +397,20 @@ def extract_chapter_state(work_id: str, chapter_no: int):
     chapter = next((item for item in work.get("chapters", []) if item.get("chapter_no") == chapter_no), None)
     if not chapter:
         raise HTTPException(status_code=404, detail="章节不存在")
-    return extract_and_persist(work, chapter, "manual-rerun")
+    return extract_and_persist(work, chapter, "manual-rerun", force=True)
+
+
+@app.post("/api/works/{work_id}/state-extractions/{extraction_id}/review")
+def review_state_extraction(work_id: str, extraction_id: str, payload: StateReviewRequest):
+    _work_or_404(work_id)
+    try:
+        result = review_extraction(
+            work_id,
+            extraction_id,
+            [item.model_dump() for item in payload.items],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="状态提取记录不存在")
+    return result

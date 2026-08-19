@@ -5,16 +5,22 @@
 """
 
 import json
+import hashlib
 import logging
 import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Any, TypedDict
 
-from app.config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
+from app.config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_TIMEOUT_SECONDS
+from app.services.context_builder import build_context
 
 from langgraph.graph import END, StateGraph
 
 logger = logging.getLogger(__name__)
-STATE_EXTRACTOR_VERSION = "v1"
+STATE_EXTRACTOR_VERSION = "v2"
 STATE_FIELDS = {
     "location",
     "goal",
@@ -27,6 +33,78 @@ STATE_FIELDS = {
     "conflict",
     "faction",
 }
+
+PROMPT_VERSION = "novel-writing-v2"
+
+SETUP_SYSTEM_PROMPT = """你是一名长篇中文类型小说的故事架构师。请建立可长期执行的故事档案，而不是写宣传文案。
+
+要求：
+1. 明确主角的外部目标、内在缺口、现实阻力和必须付出的代价。
+2. 世界规则必须能影响人物选择；不要堆砌与剧情无关的设定。
+3. 为每个主要人物写清目标、冲突、已知信息、隐藏信息、行为边界和说话/行动倾向。
+4. 主线必须有因果链：事件为什么发生、人物为什么介入、失败会失去什么。
+5. 结局方向必须能由前期选择逐步推导，不能只写抽象主题。
+6. 文风规则必须可执行，描述节奏、叙事视角、对白特点和应减少的表达习惯。
+7. 所有设定服务于后续章节写作，避免“宏大但不可写”的空泛设定。
+"""
+
+OUTLINE_SYSTEM_PROMPT = """你是一名长篇中文类型小说的故事导演。请把故事档案拆成可以连续写作的章节合同。
+
+每章必须回答：上一章结束时人物处于什么状态？本章为什么从这里开始？人物采取什么行动？阻力如何产生？行动造成什么不可逆后果？下一章从哪个具体状态接续？
+
+要求：
+1. 以卷级主线和已确认事实为约束，不为了凑章节数制造无因事件。
+2. 每个 beat 都要包含前因、行动、阻力和结果，结果必须推动下一步。
+3. 标明人物知识变化，禁止让人物提前知道尚未获得的信息。
+4. 标明本章推进、埋设、误导或回收的伏笔，禁止提前揭露后续秘密。
+5. 每章必须有 opening_state 和 ending_state，便于正文连续承接。
+6. 结尾钩子必须是具体的新局面、发现、选择或代价，不写空泛预告。
+"""
+
+CHAPTER_SYSTEM_PROMPT = """你是一名成熟的中文类型小说作者。你的任务是把章节合同写成正在发生的场景，而不是解释、概括或评价故事。
+
+事实优先级：已确认的世界规则和人物事实 > 生成本章之前的状态快照和时间线 > 当前章节合同 > 作者本次补充指令 > 文风偏好。发生冲突时保留已确认事实，并在 continuity_warnings 中说明，不能自行圆谎。
+
+连续性规则：
+1. 从 opening_state 的时间、地点、动作和人物状态自然接续，不重新开场，不重复上一章摘要。
+2. 人物只能使用已经获得的信息；物品、伤势、关系、承诺、怀疑和未完成行动必须产生后果。
+3. 每个主要情节节点都必须由前一个动作、信息或选择触发，不能为了完成大纲突然跳转。
+4. 未经本章合同允许，不提前揭露秘密，不提前完成后续章节事件。
+5. 结尾必须形成具体的新局面，并与 ending_state 和 next_chapter_boundary 对齐。
+
+自然表达规则：
+1. 严格使用指定视角，只写视角人物能够感知、回忆或合理推断的信息。
+2. 优先用动作、对白、物件和环境反馈表现情绪，减少“他意识到/他明白/他感到”的解释。
+3. 对话允许停顿、打断、回避、误解和答非所问；人物不轮流发表完整观点。
+4. 背景信息在人物确实需要时自然出现，不集中讲解设定。
+5. 句式和段落长度自然变化，不机械排比，不堆叠形容词和万能比喻。
+6. 删除不影响人物判断、行动、关系或气氛的套话、空泛升华和重复解释。
+7. 章末不总结主题，不使用“这一切才刚刚开始”一类万能悬念。
+8. 不模仿具体作者，不复用其他作品的标志性表达。
+
+写完后静默检查：是否承接上一章最后的具体状态；是否出现知识越界或状态跳变；是否漏掉必要事件；是否提前消耗后续剧情；是否存在可以删除而不影响内容的套话。
+"""
+
+EDITOR_SYSTEM_PROMPT = """你是中文类型小说责任编辑。请在不改变事件顺序、事实结果、人物知识、伏笔含义和章节结尾状态的前提下，修改正文初稿。
+
+重点处理：
+1. 删除剧情总结、重复解释和空泛升华；
+2. 将抽象情绪改为可观察的动作、生理反应、对白或选择；
+3. 修正过度完整、用于讲解剧情的对白；
+4. 删除机械排比、万能比喻和重复句式；
+5. 修正视角越界和人物声音趋同；
+6. 保留有叙事作用的具体细节，不把全文润色成统一腔调。
+
+禁止新增重大事件、人物、线索、设定或事实。若发现连续性问题，只列入 continuity_warnings，不得擅自改动事实。
+"""
+
+EXTRACTION_SYSTEM_PROMPT = """你是小说作品状态提取器。只提取本章正文中明确出现、可以逐字找到证据的事实。
+
+禁止猜测、补全、根据常识推断，禁止替正文决定旧状态、伏笔预计回收章节或人物真实动机。
+old_value 由系统根据上一章状态快照提供；你只返回正文明确产生的新状态、证据和置信度。
+emotion 默认视为本场景临时情绪，只有正文明确表现为持续变化时才标记为 persistent。
+无法确定的时间保留原文并标记 unknown 或 relative。
+"""
 
 
 class ChapterGraphState(TypedDict):
@@ -59,23 +137,93 @@ def _parse_json(text: str) -> dict[str, Any] | list[Any]:
 
 class NovelEngine:
     def __init__(self):
-        self._client = None
+        self._clients: dict[str, Any] = {}
 
-    def _llm_json(self, system: str, user: str):
-        if not LLM_API_KEY:
+    def _codex_json(self, system: str, user: str, profile: dict[str, Any]) -> Any:
+        """Use the officially supported local Codex CLI session, not a private HTTP endpoint."""
+        command = shutil.which("codex") or shutil.which("codex.cmd")
+        if not command:
+            raise RuntimeError("Codex Auth 需要在运行 worker 的机器安装 Codex CLI")
+        output_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(prefix="novel-codex-", suffix=".txt", delete=False) as output:
+                output_path = output.name
+            prompt = (
+                f"{system}\n只输出合法 JSON，不要 Markdown 代码块，不要解释。\n"
+                f"{user}"
+            )
+            command_args = [
+                command,
+                "exec",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "read-only",
+                "--output-last-message",
+                output_path,
+            ]
+            model = str(profile.get("model") or "").strip()
+            if model:
+                command_args.extend(["--model", model])
+            reasoning = str(profile.get("reasoning_effort") or "auto")
+            if reasoning != "auto":
+                command_args.extend(["--config", f"model_reasoning_effort={reasoning}"])
+            result = subprocess.run(
+                command_args,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=float(profile.get("timeout_seconds") or LLM_TIMEOUT_SECONDS),
+                check=False,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "Codex exec 失败").strip()
+                raise RuntimeError(detail[-1000:])
+            content = Path(output_path).read_text(encoding="utf-8").strip()
+            if not content:
+                content = result.stdout.strip()
+            return _parse_json(content)
+        finally:
+            if output_path:
+                try:
+                    Path(output_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _llm_json(
+        self,
+        system: str,
+        user: str,
+        profile: dict[str, Any] | None = None,
+        temperature: float = 0.7,
+    ):
+        if (profile or {}).get("provider") == "codex_auth":
+            return self._codex_json(system, user, profile or {})
+        api_key = (profile or {}).get("api_key") or LLM_API_KEY
+        if not api_key:
             return None
         try:
             from langchain_openai import ChatOpenAI
 
-            if self._client is None:
-                self._client = ChatOpenAI(
-                    api_key=LLM_API_KEY,
-                    base_url=LLM_BASE_URL,
-                    model=LLM_MODEL,
-                    temperature=0.7,
-                    timeout=90,
-                )
-            result = self._client.invoke(
+            base_url = (profile or {}).get("base_url") or LLM_BASE_URL
+            model = (profile or {}).get("model") or LLM_MODEL
+            timeout = (profile or {}).get("timeout_seconds") or LLM_TIMEOUT_SECONDS
+            key_fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+            profile_key = str((profile or {}).get("id") or f"{base_url}:{model}") + f":{base_url}:{model}:{key_fingerprint}:{(profile or {}).get('reasoning_effort', 'auto')}:{temperature}"
+            if profile_key not in self._clients:
+                kwargs: dict[str, Any] = {
+                    "api_key": api_key,
+                    "base_url": base_url,
+                    "model": model,
+                    "temperature": temperature,
+                    "timeout": timeout,
+                }
+                reasoning = (profile or {}).get("reasoning_effort")
+                if reasoning and reasoning != "auto":
+                    kwargs["model_kwargs"] = {"reasoning_effort": reasoning}
+                    if (profile or {}).get("provider") == "deepseek":
+                        kwargs["model_kwargs"]["thinking"] = {"type": "enabled"}
+                self._clients[profile_key] = ChatOpenAI(**kwargs)
+            result = self._clients[profile_key].invoke(
                 [
                     ("system", system + "\n只输出合法 JSON，不要 Markdown 代码块，不要解释。"),
                     ("user", user),
@@ -128,28 +276,43 @@ class NovelEngine:
             ],
         }
 
-    def generate_setup(self, work: dict[str, Any]) -> dict[str, Any]:
+    def generate_setup(self, work: dict[str, Any], profile: dict[str, Any] | None = None) -> dict[str, Any]:
         fallback = self.setup(work)
         result = self._llm_json(
-            "你是故事导演。为网络长篇小说建立可执行的故事档案，避免空泛设定。",
+            SETUP_SYSTEM_PROMPT,
             json.dumps(
                 {
                     "task": "生成故事初始化方案",
                     "work": {key: work.get(key, "") for key in ("title", "genre", "target_audience", "estimated_words", "writing_style", "premise")},
                     "schema": {
-                        "story_bible": {"summary": "", "theme": "", "world": "", "ending": "", "style_rules": ""},
-                        "characters": [{"name": "", "role": "", "goal": "", "conflict": "", "personality": "", "background": "", "status": "", "knowledge": ""}],
-                        "plot_arcs": [{"title": "", "synopsis": "", "sequence": 1}],
+                        "story_bible": {
+                            "summary": "",
+                            "theme": "",
+                            "world": "",
+                            "ending": "",
+                            "style_rules": "包含叙事视角、句式节奏、对白特点、情绪表现方式和应减少的套话。",
+                        },
+                        "characters": [{
+                            "name": "", "role": "", "goal": "", "conflict": "",
+                            "personality": "包含行为边界和说话/行动倾向",
+                            "background": "", "status": "", "knowledge": "",
+                        }],
+                        "plot_arcs": [{
+                            "title": "", "synopsis": "包含起点、关键因果和结束状态", "sequence": 1,
+                        }],
                     },
                 },
                 ensure_ascii=False,
-            ),
+            ), profile, 0.5,
         )
-        return result if isinstance(result, dict) and result.get("story_bible") else fallback
+        output = result if isinstance(result, dict) and result.get("story_bible") else fallback
+        output["prompt_version"] = PROMPT_VERSION
+        return output
 
-    def generate_outline(self, work: dict[str, Any], chapter_count: int) -> dict[str, Any]:
+    def generate_outline(self, work: dict[str, Any], chapter_count: int, profile: dict[str, Any] | None = None) -> dict[str, Any]:
         bible = work.get("story_bible") or {}
         characters = work.get("characters") or []
+        plot_arcs = work.get("plot_arcs") or []
         fallback_items = []
         for chapter_no in range(1, chapter_count + 1):
             phase = "建立悬念" if chapter_no <= 3 else ("冲突升级" if chapter_no < chapter_count else "留下选择")
@@ -161,6 +324,14 @@ class NovelEngine:
                     "conflict": "主角的目标与现实限制发生正面冲突。",
                     "beats": ["具体场景切入", "出现阻力", "人物做出选择"],
                     "hook": "结尾留下一个新的信息或问题。",
+                    "pov_character": "主视角人物",
+                    "opening_state": {"time": "承接上一章", "location": "", "carry_over_action": ""},
+                    "causal_beats": [{"cause": "", "action": "", "obstacle": "", "consequence": ""}],
+                    "knowledge_changes": [],
+                    "state_changes": [],
+                    "foreshadow_actions": [],
+                    "forbidden_reveals": [],
+                    "ending_state": {"location": "", "new_problem": "", "next_action": ""},
                 }
             )
         user = json.dumps(
@@ -169,16 +340,64 @@ class NovelEngine:
                 "chapter_count": chapter_count,
                 "story_bible": bible,
                 "characters": characters,
-                "schema": [{"chapter_no": 1, "title": "", "goal": "", "conflict": "", "beats": [""], "hook": ""}],
+                "plot_arcs": plot_arcs,
+                "existing_chapters": [
+                    {"chapter_no": item.get("chapter_no"), "title": item.get("title", "")}
+                    for item in (work.get("chapters") or [])
+                ],
+                "schema": [{
+                    "chapter_no": 1, "title": "", "pov_character": "", "goal": "", "conflict": "",
+                    "beats": [""], "hook": "", "opening_state": {}, "causal_beats": [],
+                    "knowledge_changes": [], "state_changes": [], "foreshadow_actions": [],
+                    "forbidden_reveals": [], "ending_state": {},
+                }],
             },
             ensure_ascii=False,
         )
         result = self._llm_json(
-            "你是故事导演。把长篇故事拆成有推进、有冲突、有结尾钩子的章节计划。",
-            user,
+            OUTLINE_SYSTEM_PROMPT,
+            user, profile, 0.45,
         )
         items = result.get("chapters") if isinstance(result, dict) else result
-        return {"chapters": items if isinstance(items, list) and items else fallback_items}
+        return {
+            "chapters": items if isinstance(items, list) and items else fallback_items,
+            "prompt_version": PROMPT_VERSION,
+        }
+
+    def generate_trend_ideas(self, items: list[dict[str, Any]], profile: dict[str, Any] | None = None) -> dict[str, Any]:
+        compact = [{key: item.get(key, "") for key in ("title", "author", "category", "synopsis", "rank", "source")} for item in items]
+        result = self._llm_json(
+            "你是网络文学市场编辑。只根据公开榜单元数据分析趋势，禁止复述或仿写任何来源作品。输出5个完全原创的创意。",
+            json.dumps({
+                "task": "热门网文趋势与原创灵感",
+                "sources": compact,
+                "schema": {
+                    "trend_summary": "",
+                    "rising_themes": [""],
+                    "overcrowded_directions": [""],
+                    "ideas": [{"title": "", "genre": "", "audience": "", "hook": "", "premise": "", "synopsis": "", "differentiation": "", "risk": ""}],
+                },
+            }, ensure_ascii=False), profile,
+        )
+        if isinstance(result, dict) and isinstance(result.get("ideas"), list) and result["ideas"]:
+            result["ideas"] = result["ideas"][:5]
+            return result
+        titles = [str(item.get("title", "热门作品")) for item in items[:3]]
+        return {
+            "trend_summary": "当前榜单显示，读者偏好集中在强冲突、明确目标和持续悬念。",
+            "rising_themes": ["高概念开局", "关系冲突", "连续悬念"],
+            "overcrowded_directions": ["直接套用热门书名或人物关系", "只替换背景的同质化设定"],
+            "ideas": [{
+                "title": f"未命名的{index + 1}号潮汐",
+                "genre": item.get("category") or "都市成长",
+                "audience": "长篇连载读者",
+                "hook": "一个看似普通的选择牵动隐藏秩序。",
+                "premise": "主角必须在真相公开前完成一次不可逆的选择。",
+                "synopsis": "本创意仅参考榜单题材信号，不复用来源作品的正文、角色或情节。",
+                "differentiation": f"从榜单作品的共同题材信号出发，与来源《{titles[0] if titles else '热门作品'}》保持人物和情节独立。",
+                "risk": "需要避免使用过于相似的标题和开局桥段。",
+            } for index, item in enumerate((items or [{}])[:5])],
+        }
 
     @staticmethod
     def _normalize_extraction(result: Any, chapter: dict[str, Any]) -> dict[str, Any]:
@@ -201,6 +420,7 @@ class NovelEngine:
                     "field": change["field"],
                     "old_value": change.get("old_value"),
                     "new_value": change.get("new_value"),
+                    "durability": str(change.get("durability", "unknown")).strip() or "unknown",
                     "evidence": str(change.get("evidence", "")).strip(),
                     "confidence": confidence,
                 })
@@ -229,24 +449,45 @@ class NovelEngine:
                 "evidence": str(item.get("evidence", "")).strip(),
                 "confidence": confidence,
             })
+        foreshadows: list[dict[str, Any]] = []
+        for item in result.get("foreshadows", []) if isinstance(result.get("foreshadows"), list) else []:
+            if not isinstance(item, dict) or not str(item.get("clue", "")).strip():
+                continue
+            try:
+                confidence = max(0.0, min(1.0, float(item.get("confidence", 0.5))))
+            except (TypeError, ValueError):
+                confidence = 0.5
+            foreshadows.append({
+                "clue": str(item["clue"]).strip(),
+                "kind": str(item.get("kind", "clue")).strip() or "clue",
+                "planted_chapter": int(item.get("planted_chapter") or chapter.get("chapter_no", 0)),
+                "expected_reveal_chapter": 0,
+                "evidence": str(item.get("evidence", "")).strip(),
+                "confidence": confidence,
+            })
         return {
             "chapter_no": int(chapter.get("chapter_no", 0)),
             "characters": characters,
             "timeline_events": timeline_events,
+            "foreshadows": foreshadows,
             "warnings": [str(item) for item in result.get("warnings", []) if str(item).strip()],
         }
 
-    def extract_state_changes(self, work: dict[str, Any], chapter: dict[str, Any]) -> dict[str, Any]:
+    def extract_state_changes(self, work: dict[str, Any], chapter: dict[str, Any], profile: dict[str, Any] | None = None) -> dict[str, Any]:
         """只提取本章明确证据，结果用于审核，不直接写入正式状态。"""
         content = str(chapter.get("content", "")).strip()
+        chapter_context = build_context(work, int(chapter.get("chapter_no") or 0))
+        context_by_name = {item.get("name"): item for item in chapter_context.get("characters", [])}
         character_context = [
-            {key: item.get(key, "") for key in ("name", "role", "goal", "status", "knowledge")}
+            {
+                key: item.get(key, "")
+                for key in ("name", "role", "goal", "status", "knowledge")
+            }
+            | {"previous_confirmed_state": context_by_name.get(item.get("name"), {}).get("confirmed_state", {})}
             for item in work.get("characters", [])
         ]
         result = self._llm_json(
-            "你是小说作品状态提取器。只抽取正文明确写出的角色状态变化和时间线事件。"
-            "绝不猜测、补全或根据常识推断；每个变化必须给出正文中的原句作为 evidence。"
-            "无法确定的时间保留原文并标记 unknown 或 relative。",
+            EXTRACTION_SYSTEM_PROMPT,
             json.dumps({
                 "task": "从本章正文提取可审核的作品状态变化",
                 "chapter": {"chapter_no": chapter.get("chapter_no"), "title": chapter.get("title"), "content": content},
@@ -255,12 +496,13 @@ class NovelEngine:
                     "characters": [{
                         "character_name": "",
                         "aliases": [],
-                        "changes": [{"field": "location|goal|emotion|relationship|possession|physical_state|knowledge|secret_exposed|conflict|faction", "old_value": None, "new_value": None, "evidence": "", "confidence": 0.0}],
+                        "changes": [{"field": "location|goal|emotion|relationship|possession|physical_state|knowledge|secret_exposed|conflict|faction", "old_value": "从 previous_confirmed_state 复制，不要猜测", "new_value": None, "durability": "scene|persistent|unknown", "evidence": "", "confidence": 0.0}],
                     }],
                     "timeline_events": [{"title": "", "description": "", "story_time_text": "", "time_type": "absolute|relative|sequence|unknown", "location": "", "participants": [], "evidence": "", "confidence": 0.0}],
+                    "foreshadows": [{"clue": "", "kind": "clue", "planted_chapter": 0, "expected_reveal_chapter": 0, "evidence": "", "confidence": 0.0}],
                     "warnings": [],
                 },
-            }, ensure_ascii=False),
+            }, ensure_ascii=False), profile, 0.1,
         )
         if result is None:
             first_sentence = next((line.strip() for line in content.replace("。", "。\n").splitlines() if line.strip()), "")
@@ -281,7 +523,7 @@ class NovelEngine:
             }
         return self._normalize_extraction(result, chapter)
 
-    def _write_chapter(self, work: dict[str, Any], chapter_no: int, mode: str, instruction: str = "") -> dict[str, Any]:
+    def _write_chapter(self, work: dict[str, Any], chapter_no: int, mode: str, instruction: str = "", profile: dict[str, Any] | None = None) -> dict[str, Any]:
         plan = next(
             (item for item in work.get("chapter_plans", []) if item.get("chapter_no") == chapter_no),
             None,
@@ -293,47 +535,126 @@ class NovelEngine:
             "beats": [],
             "hook": "留下下一章的动力。",
         }
-        previous = work.get("chapters", [])[-3:]
+        context = build_context(work, chapter_no)
+        mode_rules = {
+            "plan": "只根据本章计划写作，不改变计划中的事实和顺序。",
+            "chapter": "生成完整的新章节。",
+            "continue": "必须紧接上一章末尾继续，不得重新开场、复述前文或跳过承接动作。",
+            "rewrite": "保留原章节的事实、事件顺序、人物知识和结尾结果，只改写表达。",
+        }.get(mode, "生成完整的新章节。")
+        current_chapter = next(
+            (item for item in (work.get("chapters") or []) if int(item.get("chapter_no") or 0) == chapter_no),
+            None,
+        )
         fallback_title = plan.get("title") or f"第{chapter_no}章"
         fallback_content = (
             f"{fallback_title}\n\n"
-            f"主角原本只想把事情按计划推进，但{plan.get('conflict') or '新的阻力突然出现'}。"
-            "他先确认了眼前能掌握的线索，又发现关键人物隐瞒了一部分信息。"
-            "房间里短暂安静下来，主角没有立刻回答，而是把那件事重新问了一遍。"
-            f"\n\n这一章结束时，{plan.get('hook') or '一个新的问题浮出水面'}"
+            f"{plan.get('opening_state', {}).get('carry_over_action') or '人物刚准备处理眼前的问题'}，"
+            f"却被{plan.get('conflict') or '一个具体的阻力'}打断。"
+            "他没有急着解释，只先确认手里能用的东西和对方已经知道的部分。"
+            f"\n\n事情留下了一个必须在下一步处理的后果：{plan.get('hook') or '一个新的问题摆到了面前'}。"
         )
         result = self._llm_json(
-            "你是网络小说作者。按章节计划写具体、有场景、有动作和对白的正文，避免总结式流水账。",
+            CHAPTER_SYSTEM_PROMPT,
             json.dumps(
                 {
                     "task": "生成章节正文",
                     "mode": mode,
-                    "instruction": instruction,
+                    "mode_rules": mode_rules,
+                    "author_instruction": instruction,
                     "chapter_plan": plan,
-                    "story_bible": work.get("story_bible") or {},
-                    "characters": work.get("characters") or [],
-                    "previous_chapters": previous,
-                    "schema": {"chapter_no": chapter_no, "title": "", "content": "", "state_updates": []},
+                    "context": context,
+                    "existing_content": current_chapter.get("content", "") if current_chapter and mode == "rewrite" else "",
+                    "schema": {"chapter_no": chapter_no, "title": "", "content": "", "continuity_warnings": []},
+                },
+                ensure_ascii=False,
+            ), profile, 0.82,
+        )
+        if isinstance(result, dict) and result.get("content"):
+            return {
+                "chapter_no": chapter_no,
+                "title": result.get("title", fallback_title),
+                "content": result["content"],
+                "continuity_warnings": result.get("continuity_warnings", []),
+                "generation_source": "llm",
+                "prompt_version": PROMPT_VERSION,
+            }
+        return {
+            "chapter_no": chapter_no,
+            "title": fallback_title,
+            "content": fallback_content,
+            "continuity_warnings": ["模型未返回正文，使用本地 fallback。"],
+            "generation_source": "fallback",
+            "prompt_version": PROMPT_VERSION,
+        }
+
+    def _edit_chapter(
+        self,
+        work: dict[str, Any],
+        chapter_no: int,
+        draft: dict[str, Any],
+        profile: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not draft.get("content") or draft.get("generation_source") == "fallback":
+            return draft
+        context = build_context(work, chapter_no)
+        result = self._llm_json(
+            EDITOR_SYSTEM_PROMPT,
+            json.dumps(
+                {
+                    "task": "在事实锁定下编辑章节正文",
+                    "chapter_no": chapter_no,
+                    "chapter_plan": next((item for item in work.get("chapter_plans", []) if item.get("chapter_no") == chapter_no), {}),
+                    "context": context,
+                    "draft": draft["content"],
+                    "schema": {
+                        "title": draft.get("title", ""),
+                        "content": "",
+                        "continuity_warnings": [],
+                        "edit_notes": [],
+                    },
                 },
                 ensure_ascii=False,
             ),
+            profile,
+            0.25,
         )
         if isinstance(result, dict) and result.get("content"):
-            return {"chapter_no": chapter_no, "title": result.get("title", fallback_title), "content": result["content"], "state_updates": result.get("state_updates", [])}
-        return {"chapter_no": chapter_no, "title": fallback_title, "content": fallback_content, "state_updates": []}
+            return {
+                **draft,
+                "title": result.get("title") or draft.get("title"),
+                "content": result["content"],
+                "continuity_warnings": [
+                    *(draft.get("continuity_warnings") or []),
+                    *(result.get("continuity_warnings") or []),
+                ],
+                "editor_notes": result.get("edit_notes") or [],
+            }
+        return draft
 
-    def generate_chapter(self, work: dict[str, Any], chapter_no: int, mode: str, instruction: str = "") -> dict[str, Any]:
+    def generate_chapter(self, work: dict[str, Any], chapter_no: int, mode: str, instruction: str = "", profile: dict[str, Any] | None = None) -> dict[str, Any]:
         """用 LangGraph 串起作者节点和责任编辑节点，保留后续扩展空间。"""
+        if mode != "rewrite":
+            continuity_warnings = build_context(work, chapter_no).get("continuity_warnings", [])
+            blocking = [
+                warning for warning in continuity_warnings
+                if "未来信息" in str(warning) or "重写章节" in str(warning)
+            ]
+            if blocking:
+                raise ValueError("当前章节的前置状态尚未重建：" + "；".join(str(item) for item in blocking[:3]))
+
         def writer(state: ChapterGraphState) -> ChapterGraphState:
-            return {**state, "data": self._write_chapter(state["work"], state["chapter_no"], state["mode"], state["instruction"])}
+            return {**state, "data": self._write_chapter(state["work"], state["chapter_no"], state["mode"], state["instruction"], profile)}
 
         def editor(state: ChapterGraphState) -> ChapterGraphState:
-            data = state["data"]
+            data = self._edit_chapter(state["work"], state["chapter_no"], state["data"], profile)
             normalized = {
                 "chapter_no": state["chapter_no"],
                 "title": str(data.get("title") or f"第{state['chapter_no']}章").strip(),
                 "content": str(data.get("content") or "").strip(),
-                "state_updates": data.get("state_updates") if isinstance(data.get("state_updates"), list) else [],
+                "continuity_warnings": data.get("continuity_warnings") if isinstance(data.get("continuity_warnings"), list) else [],
+                "generation_source": data.get("generation_source", "unknown"),
+                "editor_notes": data.get("editor_notes") if isinstance(data.get("editor_notes"), list) else [],
             }
             return {**state, "data": normalized}
 

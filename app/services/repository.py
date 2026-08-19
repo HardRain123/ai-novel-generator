@@ -45,10 +45,41 @@ def _build_work(conn, work: dict[str, Any]) -> dict[str, Any]:
         "SELECT * FROM chapters WHERE work_id = ? ORDER BY chapter_no", (work_id,)
     ).fetchall()
     timeline = conn.execute(
-        "SELECT * FROM timeline_events WHERE work_id = ? ORDER BY event_order, id", (work_id,)
+        """
+        SELECT e.*, se.status AS source_extraction_status
+        FROM timeline_events e
+        LEFT JOIN state_extractions se ON se.id = e.source_extraction_id
+        WHERE e.work_id = ? ORDER BY e.event_order, e.id
+        """,
+        (work_id,),
     ).fetchall()
     foreshadows = conn.execute(
         "SELECT * FROM foreshadows WHERE work_id = ? ORDER BY planted_chapter, id", (work_id,)
+    ).fetchall()
+    character_states = conn.execute(
+        """
+        SELECT s.*, c.name AS character_name, se.status AS source_extraction_status
+        FROM character_states s
+        JOIN characters c ON c.id = s.character_id
+        LEFT JOIN chapter_versions cv ON cv.id = s.source_version_id
+        LEFT JOIN state_extractions se ON se.chapter_version_id = cv.id AND se.status IN ('applied', 'superseded')
+        WHERE s.work_id = ? ORDER BY c.created_at
+        """,
+        (work_id,),
+    ).fetchall()
+    character_state_history = conn.execute(
+        """
+        SELECT csc.*, cv.chapter_no, cv.id AS chapter_version_id,
+               se.status AS source_extraction_status
+        FROM character_state_changes csc
+        JOIN state_extractions se ON se.id = csc.extraction_id
+        JOIN chapter_versions cv ON cv.id = se.chapter_version_id
+        WHERE csc.work_id = ?
+          AND csc.status = 'accepted'
+          AND se.status = 'applied'
+        ORDER BY cv.chapter_no, csc.created_at, csc.id
+        """,
+        (work_id,),
     ).fetchall()
     reports = conn.execute(
         "SELECT * FROM quality_reports WHERE work_id = ? ORDER BY created_at DESC", (work_id,)
@@ -59,11 +90,32 @@ def _build_work(conn, work: dict[str, Any]) -> dict[str, Any]:
     result["characters"] = [_row(row) for row in characters]
     result["plot_arcs"] = [_row(row) for row in arcs]
     result["chapter_plans"] = [
-        {**_row(row), "beats": json_loads(row["beats"], [])} for row in plans
+        {
+            **_row(row),
+            "beats": json_loads(row["beats"], []),
+            "opening_state": json_loads(row["opening_state_json"], {}),
+            "causal_beats": json_loads(row["causal_beats_json"], []),
+            "knowledge_changes": json_loads(row["knowledge_changes_json"], []),
+            "state_changes": json_loads(row["state_changes_json"], []),
+            "foreshadow_actions": json_loads(row["foreshadow_actions_json"], []),
+            "forbidden_reveals": json_loads(row["forbidden_reveals_json"], []),
+            "ending_state": json_loads(row["ending_state_json"], {}),
+        }
+        for row in plans
     ]
     result["chapters"] = [_row(row) for row in chapters]
     result["timeline_events"] = [_row(row) for row in timeline]
     result["foreshadows"] = [_row(row) for row in foreshadows]
+    result["character_states"] = [
+        {**_row(row), "state": json_loads(row["state_json"], {})} for row in character_states
+    ]
+    result["character_state_history"] = []
+    for row in character_state_history:
+        item = _row(row)
+        item["old_value"] = json_loads(item.get("old_value_json"), None)
+        item["new_value"] = json_loads(item.get("new_value_json"), None)
+        item["reviewed_value"] = json_loads(item.get("reviewed_value_json"), None)
+        result["character_state_history"].append(item)
     result["quality_reports"] = [
         {**_row(row), "issues": json_loads(row["issues_json"], [])} for row in reports
     ]
@@ -77,8 +129,8 @@ def create_work(payload: dict[str, Any], user_id: str = "demo-user") -> dict[str
         conn.execute(
             """
             INSERT INTO works(id, user_id, title, genre, target_audience,
-                estimated_words, writing_style, premise, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)
+                estimated_words, writing_style, premise, status, created_at, updated_at, model_profile_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)
             """,
             (
                 work_id,
@@ -91,6 +143,7 @@ def create_work(payload: dict[str, Any], user_id: str = "demo-user") -> dict[str
                 payload.get("premise", "").strip(),
                 now,
                 now,
+                payload.get("model_profile_id"),
             ),
         )
         conn.execute(
@@ -107,8 +160,8 @@ def update_work(work_id: str, payload: dict[str, Any], user_id: str = "demo-user
     allowed = {
         key: value
         for key, value in payload.items()
-        if value is not None
-        and key in {"title", "genre", "target_audience", "estimated_words", "writing_style", "premise"}
+        if (value is not None or key == "model_profile_id")
+        and key in {"title", "genre", "target_audience", "estimated_words", "writing_style", "premise", "model_profile_id"}
     }
     if not allowed:
         return get_work(work_id, user_id)
@@ -126,6 +179,11 @@ def update_work(work_id: str, payload: dict[str, Any], user_id: str = "demo-user
 
 def save_story_setup(conn, work_id: str, data: dict[str, Any]) -> None:
     now = now_iso()
+    existing_bible = conn.execute(
+        "SELECT locked FROM story_bibles WHERE work_id = ? LIMIT 1", (work_id,)
+    ).fetchone()
+    if existing_bible and int(existing_bible["locked"] or 0):
+        return
     bible = data.get("story_bible") or {}
     conn.execute(
         """
@@ -195,15 +253,29 @@ def save_outline(conn, work_id: str, items: list[dict[str, Any]]) -> None:
         chapter_no = int(item.get("chapter_no", 1))
         conn.execute(
             """
-            INSERT INTO chapter_plans(id, work_id, chapter_no, title, goal, conflict, beats, hook, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?)
+            INSERT INTO chapter_plans(
+                id, work_id, chapter_no, title, goal, conflict, beats, hook,
+                pov_character, opening_state_json, causal_beats_json,
+                knowledge_changes_json, state_changes_json, foreshadow_actions_json,
+                forbidden_reveals_json, ending_state_json, status, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?)
             ON CONFLICT(work_id, chapter_no) DO UPDATE SET title=excluded.title, goal=excluded.goal,
-                conflict=excluded.conflict, beats=excluded.beats, hook=excluded.hook, updated_at=excluded.updated_at
+                conflict=excluded.conflict, beats=excluded.beats, hook=excluded.hook,
+                pov_character=excluded.pov_character, opening_state_json=excluded.opening_state_json,
+                causal_beats_json=excluded.causal_beats_json, knowledge_changes_json=excluded.knowledge_changes_json,
+                state_changes_json=excluded.state_changes_json, foreshadow_actions_json=excluded.foreshadow_actions_json,
+                forbidden_reveals_json=excluded.forbidden_reveals_json, ending_state_json=excluded.ending_state_json,
+                updated_at=excluded.updated_at
             """,
             (
                 str(uuid4()), work_id, chapter_no, item.get("title", f"第{chapter_no}章"),
                 item.get("goal", ""), item.get("conflict", ""), json_dumps(item.get("beats", [])),
-                item.get("hook", ""), now, now,
+                item.get("hook", ""), item.get("pov_character", ""),
+                json_dumps(item.get("opening_state", {})), json_dumps(item.get("causal_beats", [])),
+                json_dumps(item.get("knowledge_changes", [])), json_dumps(item.get("state_changes", [])),
+                json_dumps(item.get("foreshadow_actions", [])), json_dumps(item.get("forbidden_reveals", [])),
+                json_dumps(item.get("ending_state", {})), now, now,
             ),
         )
 

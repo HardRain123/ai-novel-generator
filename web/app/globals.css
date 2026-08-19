@@ -17,6 +17,9 @@ button { cursor: pointer; }
 .sidebar { background: #252b30; color: #f8f5ee; padding: 28px 20px; }
 .brand { font-family: Georgia, serif; font-size: 25px; letter-spacing: .05em; margin: 0; }
 .brand-note { color: #aab0b4; font-size: 12px; margin: 8px 0 28px; }
+.global-nav { display: grid; gap: 5px; margin-bottom: 24px; }
+.nav-button { border: 0; background: transparent; color: #c7cdd0; text-align: left; padding: 9px 10px; border-radius: 8px; }
+.nav-button:hover, .nav-button.active { background: #3b4248; color: white; }
 .side-label { color: #8f989e; font-size: 11px; letter-spacing: .12em; text-transform: uppercase; margin: 22px 8px 10px; }
 .work-list { display: grid; gap: 6px; }
 .work-item { border: 0; background: transparent; color: #dfe1dd; text-align: left; border-radius: 9px; padding: 11px 10px; width: 100%; }
@@ -37,6 +40,13 @@ h3 { font-size: 15px; margin: 0 0 10px; }
 .button.primary { color: white; background: var(--accent); border-color: var(--accent); }
 .button.dark { color: white; background: #30383e; border-color: #30383e; }
 .button:disabled { opacity: .5; cursor: not-allowed; }
+.chapter-count { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; }
+.chapter-count input { width: 58px; border: 1px solid var(--line); border-radius: 8px; padding: 9px 6px; background: var(--paper); }
+.connection { display: inline-block; margin-top: 12px; font-size: 12px; }
+.connection.live { color: var(--green); }
+.connection.demo { color: #a66b36; }
+.work-model { display: inline-flex; align-items: center; gap: 8px; margin: 12px 0 0 14px; color: var(--muted); font-size: 12px; }
+.work-model select { border: 1px solid var(--line); background: var(--paper); border-radius: 7px; padding: 6px 8px; color: var(--ink); }
 .notice { background: var(--accent-light); color: #7b412d; border: 1px solid #f0d3c5; padding: 12px 15px; border-radius: 9px; font-size: 13px; margin-bottom: 20px; }
 .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
 .card { background: var(--paper); border: 1px solid var(--line); border-radius: 14px; padding: 20px; box-shadow: 0 5px 18px rgba(54, 44, 30, .035); }
@@ -81,4 +91,27 @@ h3 { font-size: 15px; margin: 0 0 10px; }
 .diff-list { display: grid; gap: 8px; }
 .muted { color: var(--muted); font-size: 13px; }
 .loading { color: var(--muted); padding: 60px 0; text-align: center; }
+.job-panel { margin-bottom: 20px; border-color: #e8c8b6; background: #fffaf5; }
+.job-terminal { opacity: .85; }
+.job-meta { display: flex; align-items: center; gap: 12px; font-family: Georgia, serif; font-size: 22px; }
+.progress-track { height: 8px; border-radius: 999px; background: #eee6dd; overflow: hidden; }
+.progress-value { height: 100%; background: var(--accent); transition: width .35s ease; }
+.error-text { color: #9d4738; font-size: 13px; margin: 10px 0 0; }
+.preset-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 18px; }
+.check { display: flex; align-items: center; gap: 8px; color: #67717b; font-size: 12px; margin: 10px 0 16px; }
+.success { color: var(--green); }
+.foreshadow-form { margin: 16px 0; }
+.foreshadow-card { padding: 16px; }
+.foreshadow-card.revealed { border-color: #b9d5c2; background: #f7fcf8; }
+.foreshadow-card.deferred { background: #fffaf0; }
+.trend-search { margin-bottom: 16px; }
+.trend-list { display: grid; gap: 8px; max-height: 650px; overflow: auto; }
+.trend-row { display: grid; grid-template-columns: auto 30px 1fr auto; align-items: start; gap: 10px; padding: 11px; border: 1px solid var(--line); border-radius: 9px; cursor: pointer; }
+.trend-row.selected { border-color: var(--accent); background: var(--accent-light); }
+.trend-row strong, .trend-row small, .trend-row em { display: block; }
+.trend-row small { color: var(--muted); margin-top: 4px; font-size: 11px; }
+.trend-row em { color: #636d74; font-style: normal; font-size: 12px; margin-top: 5px; }
+.trend-row a { color: var(--accent); font-size: 12px; }
+.rank { color: var(--accent); font-family: Georgia, serif; font-size: 18px; }
+.idea-card { background: #fffaf3; }
 @media (max-width: 900px) { .shell { grid-template-columns: 1fr; } .sidebar { padding: 18px; } .work-list { display: flex; overflow: auto; } .work-item { min-width: 170px; } .main { padding: 24px 18px 40px; } .span-4, .span-5, .span-7, .span-8 { grid-column: span 12; } .topbar { display: block; } .top-actions { justify-content: flex-start; margin-top: 18px; } }
