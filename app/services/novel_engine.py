@@ -14,6 +14,19 @@ from app.config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
 from langgraph.graph import END, StateGraph
 
 logger = logging.getLogger(__name__)
+STATE_EXTRACTOR_VERSION = "v1"
+STATE_FIELDS = {
+    "location",
+    "goal",
+    "emotion",
+    "relationship",
+    "possession",
+    "physical_state",
+    "knowledge",
+    "secret_exposed",
+    "conflict",
+    "faction",
+}
 
 
 class ChapterGraphState(TypedDict):
@@ -166,6 +179,107 @@ class NovelEngine:
         )
         items = result.get("chapters") if isinstance(result, dict) else result
         return {"chapters": items if isinstance(items, list) and items else fallback_items}
+
+    @staticmethod
+    def _normalize_extraction(result: Any, chapter: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            result = {}
+        characters: list[dict[str, Any]] = []
+        for item in result.get("characters", []) if isinstance(result.get("characters"), list) else []:
+            if not isinstance(item, dict) or not str(item.get("character_name", "")).strip():
+                continue
+            changes: list[dict[str, Any]] = []
+            raw_changes = item.get("changes") if isinstance(item.get("changes"), list) else item.get("state_changes", [])
+            for change in raw_changes if isinstance(raw_changes, list) else []:
+                if not isinstance(change, dict) or change.get("field") not in STATE_FIELDS:
+                    continue
+                try:
+                    confidence = max(0.0, min(1.0, float(change.get("confidence", item.get("confidence", 0.5)))))
+                except (TypeError, ValueError):
+                    confidence = 0.5
+                changes.append({
+                    "field": change["field"],
+                    "old_value": change.get("old_value"),
+                    "new_value": change.get("new_value"),
+                    "evidence": str(change.get("evidence", "")).strip(),
+                    "confidence": confidence,
+                })
+            if changes:
+                characters.append({
+                    "character_name": str(item["character_name"]).strip(),
+                    "aliases": [str(alias).strip() for alias in item.get("aliases", []) if str(alias).strip()],
+                    "changes": changes,
+                })
+
+        timeline_events: list[dict[str, Any]] = []
+        for item in result.get("timeline_events", []) if isinstance(result.get("timeline_events"), list) else []:
+            if not isinstance(item, dict) or not str(item.get("title", "")).strip():
+                continue
+            try:
+                confidence = max(0.0, min(1.0, float(item.get("confidence", 0.5))))
+            except (TypeError, ValueError):
+                confidence = 0.5
+            timeline_events.append({
+                "title": str(item["title"]).strip(),
+                "description": str(item.get("description", "")).strip(),
+                "story_time_text": str(item.get("story_time_text", "")).strip(),
+                "time_type": str(item.get("time_type", "unknown")).strip() or "unknown",
+                "location": str(item.get("location", "")).strip(),
+                "participants": [str(name).strip() for name in item.get("participants", []) if str(name).strip()],
+                "evidence": str(item.get("evidence", "")).strip(),
+                "confidence": confidence,
+            })
+        return {
+            "chapter_no": int(chapter.get("chapter_no", 0)),
+            "characters": characters,
+            "timeline_events": timeline_events,
+            "warnings": [str(item) for item in result.get("warnings", []) if str(item).strip()],
+        }
+
+    def extract_state_changes(self, work: dict[str, Any], chapter: dict[str, Any]) -> dict[str, Any]:
+        """只提取本章明确证据，结果用于审核，不直接写入正式状态。"""
+        content = str(chapter.get("content", "")).strip()
+        character_context = [
+            {key: item.get(key, "") for key in ("name", "role", "goal", "status", "knowledge")}
+            for item in work.get("characters", [])
+        ]
+        result = self._llm_json(
+            "你是小说作品状态提取器。只抽取正文明确写出的角色状态变化和时间线事件。"
+            "绝不猜测、补全或根据常识推断；每个变化必须给出正文中的原句作为 evidence。"
+            "无法确定的时间保留原文并标记 unknown 或 relative。",
+            json.dumps({
+                "task": "从本章正文提取可审核的作品状态变化",
+                "chapter": {"chapter_no": chapter.get("chapter_no"), "title": chapter.get("title"), "content": content},
+                "known_characters": character_context,
+                "schema": {
+                    "characters": [{
+                        "character_name": "",
+                        "aliases": [],
+                        "changes": [{"field": "location|goal|emotion|relationship|possession|physical_state|knowledge|secret_exposed|conflict|faction", "old_value": None, "new_value": None, "evidence": "", "confidence": 0.0}],
+                    }],
+                    "timeline_events": [{"title": "", "description": "", "story_time_text": "", "time_type": "absolute|relative|sequence|unknown", "location": "", "participants": [], "evidence": "", "confidence": 0.0}],
+                    "warnings": [],
+                },
+            }, ensure_ascii=False),
+        )
+        if result is None:
+            first_sentence = next((line.strip() for line in content.replace("。", "。\n").splitlines() if line.strip()), "")
+            names = [str(item.get("name")) for item in work.get("characters", []) if item.get("name") and str(item["name"]) in content]
+            result = {
+                "characters": [],
+                "timeline_events": ([{
+                    "title": chapter.get("title") or f"第{chapter.get('chapter_no', 0)}章事件",
+                    "description": first_sentence[:240],
+                    "story_time_text": "",
+                    "time_type": "unknown",
+                    "location": "",
+                    "participants": names,
+                    "evidence": first_sentence,
+                    "confidence": 0.35,
+                }] if first_sentence else []),
+                "warnings": ["当前未配置 LLM，使用本地低置信度提取；建议配置模型后重新提取。"],
+            }
+        return self._normalize_extraction(result, chapter)
 
     def _write_chapter(self, work: dict[str, Any], chapter_no: int, mode: str, instruction: str = "") -> dict[str, Any]:
         plan = next(

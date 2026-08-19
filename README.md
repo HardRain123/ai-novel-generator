@@ -39,12 +39,20 @@ npm run dev
 - 章节大纲
 - 分章正文生成与编辑
 - 人物/重复内容/伏笔规则型质检
+- 章节版本和作品状态提取（角色 Diff、时间线候选，待审核）
 - SQLite 数据持久化
 
 ## 下一步
 
-1. 让作者可以编辑并锁定故事档案。
-2. 把角色状态、时间线和伏笔从正文中自动提取出来。
+1. Phase 2：作者审核并应用状态 Diff。
+2. 章节修改后从指定章节向后重放角色状态和时间线。
 3. 为质检增加 LLM 编辑角色和章节来源定位。
 4. 接入真实用户验证，再决定账号、订阅和团队协作。
 
+## Phase 1 状态提取接口
+
+- `GET /api/works/{work_id}/state-extractions?status=pending`：查看待审核结果
+- `GET /api/works/{work_id}/state-extractions/{extraction_id}`：查看单次提取
+- `POST /api/works/{work_id}/chapters/{chapter_no}/extract-state`：重新提取指定章节
+
+章节生成或手动保存后会自动产生一条 pending 提取记录。当前不会自动更新 `character_states`，也不会把候选事件当作已确认事实。

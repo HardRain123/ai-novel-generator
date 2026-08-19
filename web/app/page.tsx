@@ -17,6 +17,9 @@ type ChapterPlan = { chapter_no: number; title: string; goal: string; conflict: 
 type Chapter = { chapter_no: number; title: string; content: string; status: string };
 type Issue = { kind: string; severity: string; message: string; evidence?: string; suggestion?: string };
 type QualityReport = { chapter_no: number; score: number; issues: Issue[] };
+type StateChange = { id: string; character_name: string; field: string; old_value: unknown; new_value: unknown; evidence: string; confidence: number; status: string };
+type TimelineCandidate = { id: string; title: string; description: string; story_time_text: string; time_type: string; location: string; participants: string[]; evidence: string; confidence: number; review_status: string };
+type StateExtraction = { id: string; status: string; model: string; warning: string; chapter_version_id: string; characters: StateChange[]; timeline_events: TimelineCandidate[] };
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API}${path}`, { headers: { "Content-Type": "application/json" }, ...options });
@@ -45,6 +48,7 @@ export default function Home() {
   const [error, setError] = useState("");
   const [chapterNo, setChapterNo] = useState(1);
   const [draft, setDraft] = useState<Chapter | null>(null);
+  const [stateDiff, setStateDiff] = useState<StateExtraction | null>(null);
 
   const refreshWorks = useCallback(async () => {
     const data = await api<{ items: Work[] }>("/works");
@@ -101,8 +105,8 @@ export default function Home() {
     if (!work) return;
     setBusy("chapter"); setError("");
     try {
-      const data = await api<{ work: Work; data: Chapter; quality: QualityReport }>(`/works/${work.id}/generate/chapter`, { method: "POST", body: JSON.stringify({ chapter_no: chapterNo, mode: "chapter" }) });
-      setWork(data.work); setDraft(data.data); setTab("write");
+      const data = await api<{ work: Work; data: Chapter; quality: QualityReport; state_extraction: StateExtraction }>(`/works/${work.id}/generate/chapter`, { method: "POST", body: JSON.stringify({ chapter_no: chapterNo, mode: "chapter" }) });
+      setWork(data.work); setDraft(data.data); setStateDiff(data.state_extraction); setTab("write");
     } catch (e) { setError((e as Error).message); } finally { setBusy(""); }
   }
 
@@ -110,8 +114,8 @@ export default function Home() {
     if (!work || !draft) return;
     setBusy("save"); setError("");
     try {
-      const data = await api<{ work: Work }>(`/works/${work.id}/chapters/${chapterNo}`, { method: "PATCH", body: JSON.stringify({ title: draft.title, content: draft.content, status: draft.status }) });
-      setWork(data.work); setDraft(data.work.chapters?.find((item) => item.chapter_no === chapterNo) || draft);
+      const data = await api<{ work: Work; state_extraction: StateExtraction }>(`/works/${work.id}/chapters/${chapterNo}`, { method: "PATCH", body: JSON.stringify({ title: draft.title, content: draft.content, status: draft.status }) });
+      setWork(data.work); setDraft(data.work.chapters?.find((item) => item.chapter_no === chapterNo) || draft); setStateDiff(data.state_extraction);
     } catch (e) { setError((e as Error).message); } finally { setBusy(""); }
   }
 
@@ -146,7 +150,7 @@ export default function Home() {
           {tab === "overview" && <Overview work={work} onTab={setTab} />}
           {tab === "outline" && <Outline work={work} />}
           {tab === "assets" && <Assets work={work} onSaved={() => loadWork(work.id)} />}
-          {tab === "write" && <Writing work={work} chapterNo={chapterNo} draft={draft} plan={selectedPlan} report={latestReport} busy={busy} onSelect={selectChapter} onGenerate={generateChapter} onSave={saveChapter} onChange={setDraft} />}
+          {tab === "write" && <Writing work={work} chapterNo={chapterNo} draft={draft} plan={selectedPlan} report={latestReport} stateDiff={stateDiff} busy={busy} onSelect={selectChapter} onGenerate={generateChapter} onSave={saveChapter} onChange={setDraft} />}
         </>}
       </main>
     </div>
@@ -177,7 +181,13 @@ function Assets({ work, onSaved }: { work: Work; onSaved: () => Promise<void> })
   return <div className="grid"><div className="card span-7"><div className="toolbar"><div><h2>故事档案</h2><p className="subtitle">这是 AI 写作时会持续参考的作品记忆，也可以由作者手动修正。</p></div><button className="button primary" onClick={save} disabled={saving}>{saving ? "保存中…" : "保存档案"}</button></div><div className="field"><label>故事梗概</label><textarea value={draft.summary} onChange={(event) => setDraft({ ...draft, summary: event.target.value })} /></div><div className="field"><label>主题</label><textarea value={draft.theme} onChange={(event) => setDraft({ ...draft, theme: event.target.value })} /></div><div className="field"><label>世界观</label><textarea value={draft.world} onChange={(event) => setDraft({ ...draft, world: event.target.value })} /></div><div className="field"><label>结局方向</label><textarea value={draft.ending} onChange={(event) => setDraft({ ...draft, ending: event.target.value })} /></div><div className="field"><label>文风规则</label><textarea value={draft.style_rules} onChange={(event) => setDraft({ ...draft, style_rules: event.target.value })} /></div></div><div className="card span-5"><h3>主要人物</h3>{work.characters?.length ? <div className="asset-list">{work.characters.map((character) => <div className="asset" key={character.id}><strong>{character.name}<span className="tag">{character.role}</span></strong><p>目标：{character.goal}</p><p>冲突：{character.conflict}</p><p>状态：{character.status}</p></div>)}</div> : <p className="muted">生成故事方案后，这里会出现人物卡。</p>}</div></div>;
 }
 
-function Writing({ work, chapterNo, draft, plan, report, busy, onSelect, onGenerate, onSave, onChange }: { work: Work; chapterNo: number; draft: Chapter | null; plan?: ChapterPlan; report?: QualityReport; busy: string; onSelect: (no: number) => void; onGenerate: () => void; onSave: () => void; onChange: (chapter: Chapter | null) => void }) {
+function Writing({ work, chapterNo, draft, plan, report, stateDiff, busy, onSelect, onGenerate, onSave, onChange }: { work: Work; chapterNo: number; draft: Chapter | null; plan?: ChapterPlan; report?: QualityReport; stateDiff: StateExtraction | null; busy: string; onSelect: (no: number) => void; onGenerate: () => void; onSave: () => void; onChange: (chapter: Chapter | null) => void }) {
   const items = work.chapter_plans?.length ? work.chapter_plans : [{ chapter_no: 1, title: "第1章", goal: "", conflict: "", beats: [], hook: "" }];
-  return <div className="grid"><div className="card span-4"><div className="toolbar"><div><h3>章节</h3><span className="muted">选择要生成或修改的章节</span></div><span className="tag">{work.chapters?.length || 0} 已写</span></div><div className="chapter-list">{items.map((item) => <button key={item.chapter_no} className={`chapter-row ${item.chapter_no === chapterNo ? "active" : ""}`} onClick={() => onSelect(item.chapter_no)}><span>第{item.chapter_no}章 {item.title?.replace(/^第\d+章\s*/, "")}</span><small>{work.chapters?.some((chapterItem) => chapterItem.chapter_no === item.chapter_no) ? "已生成" : "待写"}</small></button>)}</div></div><div className="card span-8"><div className="toolbar"><div><h2>{draft?.title || plan?.title || `第${chapterNo}章`}</h2><p className="subtitle">{plan?.goal || "先生成本章，或直接输入正文。"}</p></div><div className="toolbar-actions"><button className="button primary" onClick={onGenerate} disabled={!!busy}>{busy === "chapter" ? "正在写作…" : "AI 写本章"}</button><button className="button" onClick={onSave} disabled={!!busy || !draft}>{busy === "save" ? "保存中…" : "保存修改"}</button></div></div>{plan && <div className="notice">本章冲突：{plan.conflict || "未设置"}　结尾钩子：{plan.hook || "未设置"}</div>}<div className="field"><textarea className="chapter-content" value={draft?.content || ""} onChange={(event) => onChange({ chapter_no: chapterNo, title: draft?.title || plan?.title || `第${chapterNo}章`, content: event.target.value, status: draft?.status || "draft" })} placeholder="点击“AI 写本章”，或在这里输入正文…" /></div>{report && <div className="card" style={{ padding: 15, background: "#fbfaf6" }}><div className="toolbar"><h3>本章质检</h3><span className="score">{report.score}</span></div>{report.issues?.length ? report.issues.map((issue, index) => <div className="issue" key={`${issue.kind}-${index}`}><strong>{issue.severity === "high" ? "高" : issue.severity === "medium" ? "中" : "低"} · {issue.message}</strong><p>{issue.evidence || issue.suggestion}</p></div>) : <p className="muted">暂未发现明显问题，可以继续修改或确认。</p>}</div>}</div></div>;
+  return <div className="grid"><div className="card span-4"><div className="toolbar"><div><h3>章节</h3><span className="muted">选择要生成或修改的章节</span></div><span className="tag">{work.chapters?.length || 0} 已写</span></div><div className="chapter-list">{items.map((item) => <button key={item.chapter_no} className={`chapter-row ${item.chapter_no === chapterNo ? "active" : ""}`} onClick={() => onSelect(item.chapter_no)}><span>第{item.chapter_no}章 {item.title?.replace(/^第\d+章\s*/, "")}</span><small>{work.chapters?.some((chapterItem) => chapterItem.chapter_no === item.chapter_no) ? "已生成" : "待写"}</small></button>)}</div></div><div className="card span-8"><div className="toolbar"><div><h2>{draft?.title || plan?.title || `第${chapterNo}章`}</h2><p className="subtitle">{plan?.goal || "先生成本章，或直接输入正文。"}</p></div><div className="toolbar-actions"><button className="button primary" onClick={onGenerate} disabled={!!busy}>{busy === "chapter" ? "正在写作…" : "AI 写本章"}</button><button className="button" onClick={onSave} disabled={!!busy || !draft}>{busy === "save" ? "保存中…" : "保存修改"}</button></div></div>{plan && <div className="notice">本章冲突：{plan.conflict || "未设置"}　结尾钩子：{plan.hook || "未设置"}</div>}<div className="field"><textarea className="chapter-content" value={draft?.content || ""} onChange={(event) => onChange({ chapter_no: chapterNo, title: draft?.title || plan?.title || `第${chapterNo}章`, content: event.target.value, status: draft?.status || "draft" })} placeholder="点击“AI 写本章”，或在这里输入正文…" /></div>{stateDiff && <StateDiffPanel extraction={stateDiff} />}{report && <div className="card" style={{ padding: 15, background: "#fbfaf6" }}><div className="toolbar"><h3>本章质检</h3><span className="score">{report.score}</span></div>{report.issues?.length ? report.issues.map((issue, index) => <div className="issue" key={`${issue.kind}-${index}`}><strong>{issue.severity === "high" ? "高" : issue.severity === "medium" ? "中" : "低"} · {issue.message}</strong><p>{issue.evidence || issue.suggestion}</p></div>) : <p className="muted">暂未发现明显问题，可以继续修改或确认。</p>}</div>}</div></div>;
+}
+
+function StateDiffPanel({ extraction }: { extraction: StateExtraction }) {
+  const changeCount = extraction.characters?.length || 0;
+  const eventCount = extraction.timeline_events?.length || 0;
+  return <div className="card state-diff"><div className="toolbar"><div><h3>本章作品状态变化</h3><p className="subtitle">检测到 {changeCount} 项角色变化、{eventCount} 个时间线候选。</p></div><span className="tag">待审核</span></div><p className="muted">这些结果目前不会自动写入正式作品状态，请逐项确认后再应用。</p>{extraction.warning && <div className="notice">{extraction.warning}</div>}{changeCount > 0 && <><h3>角色状态 Diff</h3><div className="diff-list">{extraction.characters.map((change) => <div className="asset" key={change.id}><strong>{change.character_name} · {change.field}</strong><p>{String(change.old_value ?? "未记录")} → {String(change.new_value ?? "未记录")}</p><p>证据：{change.evidence || "未提供"}　置信度：{Math.round(change.confidence * 100)}%</p></div>)}</div></>}{eventCount > 0 && <><h3 style={{ marginTop: 16 }}>时间线候选</h3><div className="diff-list">{extraction.timeline_events.map((event) => <div className="asset" key={event.id}><strong>{event.title}</strong><p>{event.description || "暂无描述"}</p><p>时间：{event.story_time_text || "待确认"}　地点：{event.location || "未提取"}</p><p>证据：{event.evidence || "未提供"}　置信度：{Math.round(event.confidence * 100)}%</p></div>)}</div></>}{changeCount === 0 && eventCount === 0 && <p className="muted">本章没有提取到可审核的状态变化。</p>}</div>;
 }

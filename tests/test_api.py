@@ -54,6 +54,18 @@ def test_full_novel_mvp_flow(client):
     assert chapter.status_code == 200
     assert chapter.json()["data"]["content"]
     assert chapter.json()["quality"]["score"] >= 0
+    extraction = chapter.json()["state_extraction"]
+    assert extraction["status"] == "pending"
+    assert extraction["chapter_version_id"]
+    assert len(extraction["timeline_events"]) == 1
+
+    pending = client.get(f"/api/works/{work_id}/state-extractions?status=pending")
+    assert pending.status_code == 200
+    assert len(pending.json()["items"]) == 1
+
+    extraction_detail = client.get(f"/api/works/{work_id}/state-extractions/{extraction['id']}")
+    assert extraction_detail.status_code == 200
+    assert extraction_detail.json()["id"] == extraction["id"]
 
     saved = client.patch(
         f"/api/works/{work_id}/chapters/1",
@@ -61,8 +73,12 @@ def test_full_novel_mvp_flow(client):
     )
     assert saved.status_code == 200
     assert saved.json()["work"]["chapters"][0]["content"].startswith("主角")
+    assert saved.json()["state_extraction"]["status"] == "pending"
 
     detail = client.get(f"/api/works/{work_id}")
     assert detail.status_code == 200
     assert detail.json()["chapters"][0]["chapter_no"] == 1
 
+    # 自动提取只产生待审核候选，正式角色状态不应被静默修改。
+    conn_check = client.get(f"/api/works/{work_id}/state-extractions").json()
+    assert len(conn_check["items"]) == 2

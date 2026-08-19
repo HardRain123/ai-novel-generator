@@ -24,6 +24,7 @@ from app.services.repository import (
     save_story_setup,
     update_work,
 )
+from app.services.state_extraction import extract_and_persist, get_extraction, list_extractions
 from app.utils import json_dumps, now_iso
 
 
@@ -162,7 +163,10 @@ def generate_chapter(work_id: str, payload: GenerateChapterRequest):
         save_quality_report(conn, work_id, payload.chapter_no, issues, score)
         _record_generation(conn, work_id, "chapter", payload.model_dump(), data)
         conn.execute("UPDATE works SET status='writing', updated_at=? WHERE id=?", (now_iso(), work_id))
-    return {"kind": "chapter", "data": data, "quality": {"score": score, "issues": issues}, "work": _work_or_404(work_id)}
+    updated_work = _work_or_404(work_id)
+    chapter = next(item for item in updated_work["chapters"] if item["chapter_no"] == payload.chapter_no)
+    extraction = extract_and_persist(updated_work, chapter, "generation")
+    return {"kind": "chapter", "data": data, "quality": {"score": score, "issues": issues}, "state_extraction": extraction, "work": updated_work}
 
 
 @app.patch("/api/works/{work_id}/chapters/{chapter_no}")
@@ -180,7 +184,10 @@ def update_chapter(work_id: str, chapter_no: int, payload: ChapterUpdate):
         save_chapter(conn, work_id, data)
         save_quality_report(conn, work_id, chapter_no, issues, score)
         conn.execute("UPDATE works SET updated_at=? WHERE id=?", (now_iso(), work_id))
-    return {"chapter": data, "quality": {"score": score, "issues": issues}, "work": _work_or_404(work_id)}
+    updated_work = _work_or_404(work_id)
+    chapter = next(item for item in updated_work["chapters"] if item["chapter_no"] == chapter_no)
+    extraction = extract_and_persist(updated_work, chapter, "manual")
+    return {"chapter": data, "quality": {"score": score, "issues": issues}, "state_extraction": extraction, "work": updated_work}
 
 
 @app.post("/api/works/{work_id}/quality/check")
@@ -194,3 +201,26 @@ def quality_check(work_id: str, chapter_no: int):
         save_quality_report(conn, work_id, chapter_no, issues, score)
     return {"score": score, "issues": issues}
 
+
+@app.get("/api/works/{work_id}/state-extractions")
+def state_extractions(work_id: str, status: str | None = None):
+    _work_or_404(work_id)
+    return {"items": list_extractions(work_id, status)}
+
+
+@app.get("/api/works/{work_id}/state-extractions/{extraction_id}")
+def state_extraction_detail(work_id: str, extraction_id: str):
+    _work_or_404(work_id)
+    extraction = get_extraction(work_id, extraction_id)
+    if not extraction:
+        raise HTTPException(status_code=404, detail="状态提取记录不存在")
+    return extraction
+
+
+@app.post("/api/works/{work_id}/chapters/{chapter_no}/extract-state")
+def extract_chapter_state(work_id: str, chapter_no: int):
+    work = _work_or_404(work_id)
+    chapter = next((item for item in work.get("chapters", []) if item.get("chapter_no") == chapter_no), None)
+    if not chapter:
+        raise HTTPException(status_code=404, detail="章节不存在")
+    return extract_and_persist(work, chapter, "manual-rerun")
