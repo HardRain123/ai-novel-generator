@@ -260,7 +260,7 @@ function GenerationProgress({ job, workId, onCancel, onRetry }: { job: Generatio
   return <div className={`card job-panel ${terminal ? "job-terminal" : ""}`}><div className="toolbar"><div><strong>{job.stage_label || "生成任务"}</strong><p className="muted">{job.message || (job.status === "queued" ? "等待 worker 接手" : "任务正在处理")}</p></div><div className="job-meta"><span>{job.progress || 0}%</span>{!terminal && job.status !== "cancel_requested" && <button className="button" onClick={onCancel}>取消</button>}{job.status === "failed" && <button className="button" onClick={onRetry}>重试</button>}</div></div><div className="progress-track"><div className="progress-value" style={{ width: `${Math.max(0, Math.min(100, job.progress || 0))}%` }} /></div>{job.error && <p className="error-text">{job.error}</p>}</div>;
 }
 
-function ModelSettings({ profiles, onChanged }: { profiles: ModelProfile[]; onChanged: () => Promise<void> }) {
+function ModelSettingsEditor({ profiles, onChanged }: { profiles: ModelProfile[]; onChanged: () => Promise<void> }) {
   const [editing, setEditing] = useState<ModelProfile | null>(null);
   const [form, setForm] = useState({ name: "", provider: "openai_compatible", base_url: "", model: "", api_key: "", reasoning_effort: "auto", timeout_seconds: "90", is_default: false });
   const [message, setMessage] = useState("");
@@ -273,6 +273,31 @@ function ModelSettings({ profiles, onChanged }: { profiles: ModelProfile[]; onCh
   async function test(id: string) { setMessage("测试连接中…"); try { const result = await api<{ message: string }>(`/model-profiles/${id}/test`, { method: "POST" }); setMessage(result.message); await onChanged(); } catch (e) { setMessage((e as Error).message); } }
   const codexAuth = form.provider === "codex_auth";
   return <div><div className="topbar"><div><div className="eyebrow">MODEL CENTER</div><h1>模型服务</h1><p className="subtitle">保存多个 OpenAI 兼容配置，或使用本机 Codex Auth 登录；Key 只在服务端加密保存。</p></div><button className="button" onClick={reset}>新建配置</button></div>{message && <div className="notice">{message}</div>}<div className="grid"><div className="card span-5"><h2>{editing ? "编辑模型配置" : "添加模型配置"}</h2><div className="preset-row"><button className="button" type="button" onClick={() => applyPreset("deepseek")}>DeepSeek</button><button className="button" type="button" onClick={() => applyPreset("qwen")}>通义千问</button><button className="button" type="button" onClick={() => applyPreset("kimi")}>Kimi</button><button className="button" type="button" onClick={() => applyPreset("codex_auth")}>Codex Auth</button></div><form onSubmit={save}><div className="field"><label>配置名称</label><input required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="例如：HotAI GPT-5.6 Luna" /></div>{codexAuth ? <div className="notice">Codex Auth 使用运行 worker 的机器上的 Codex CLI 登录状态。先执行 <code>codex login</code>，然后点击“测试连接”。</div> : <div className="field"><label>Base URL</label><input required value={form.base_url} onChange={(e) => setForm({ ...form, base_url: e.target.value })} placeholder="https://api.example.com/v1" /></div>}<div className="field"><label>模型名称</label><div className="toolbar"><input required list="available-models" value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} placeholder="手动填写模型 ID" />{editing && <button className="button" type="button" onClick={() => fetchModelList(editing.id)}>获取模型列表</button>}</div><datalist id="available-models">{modelOptions.map((model) => <option key={model} value={model} />)}</datalist></div>{!codexAuth && <div className="field"><label>API Key {editing && <span className="muted">（留空保持原 Key）</span>}</label><input type="password" value={form.api_key} onChange={(e) => setForm({ ...form, api_key: e.target.value })} placeholder={editing ? "已加密保存，不回显" : "sk-…"} /></div>}<div className="two-col"><div className="field"><label>推理强度</label><select value={form.reasoning_effort} onChange={(e) => setForm({ ...form, reasoning_effort: e.target.value })}><option value="auto">自动</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高 / xhigh</option></select></div><div className="field"><label>超时（秒）</label><input type="number" min="1" max="600" value={form.timeout_seconds} onChange={(e) => setForm({ ...form, timeout_seconds: e.target.value })} /></div></div><label className="check"><input type="checkbox" checked={form.is_default} onChange={(e) => setForm({ ...form, is_default: e.target.checked })} />设为默认模型</label><div className="toolbar"><button className="button primary" type="submit">保存配置</button>{editing && <button className="button" type="button" onClick={reset}>取消编辑</button>}</div></form></div><div className="card span-7"><h2>已保存配置</h2><p className="subtitle">连接测试会验证模型、JSON 输出和推理参数；不支持的参数会直接提示。</p>{profiles.length ? <div className="asset-list">{profiles.map((profile) => <div className="asset" key={profile.id}><div className="toolbar"><div><strong>{profile.name} {Boolean(profile.is_default) && <span className="tag">默认</span>}</strong><p>{profile.provider === "codex_auth" ? "Codex Auth · 本机 CLI" : `${profile.model} · ${profile.base_url}`}</p></div><span className={`tag ${profile.last_test_status === "ok" ? "success" : ""}`}>{profile.provider === "codex_auth" ? (profile.last_test_status === "ok" ? "Codex 已登录" : "待登录") : profile.has_api_key ? `Key ${profile.api_key_masked}` : "未配置 Key"}</span></div><div className="toolbar"><span className="muted">推理：{profile.reasoning_effort || "自动"} · {profile.last_test_status === "ok" ? "已验证" : "未验证"}</span><div className="toolbar-actions"><button className="button" onClick={() => test(profile.id)}>测试连接</button><button className="button" onClick={() => edit(profile)}>编辑</button></div></div></div>)}</div> : <p className="muted">还没有模型配置。添加后生成按钮会显示为实时 AI 模式。</p>}</div></div></div>;
+}
+
+function ModelSettings({ profiles, onChanged }: { profiles: ModelProfile[]; onChanged: () => Promise<void> }) {
+  const [message, setMessage] = useState("");
+
+  async function remove(profile: ModelProfile) {
+    if (!window.confirm(`确定删除模型配置“${profile.name}”吗？`)) return;
+    setMessage("删除中…");
+    try {
+      await api(`/model-profiles/${profile.id}`, { method: "DELETE" });
+      await onChanged();
+      setMessage(`已删除模型配置“${profile.name}”`);
+    } catch (e) {
+      setMessage((e as Error).message);
+    }
+  }
+
+  return <div>
+    <ModelSettingsEditor profiles={profiles} onChanged={onChanged} />
+    {message && <div className="notice">{message}</div>}
+    {profiles.length > 0 && <div className="card model-delete-panel">
+      <div className="toolbar"><div><h2>删除模型配置</h2><p className="subtitle">删除后该配置将从模型列表中移除，已生成的内容不受影响。</p></div></div>
+      <div className="asset-list">{profiles.map((profile) => <div className="asset" key={`delete-${profile.id}`}><div className="toolbar"><div><strong>{profile.name}</strong><p className="muted">{profile.model}</p></div><button className="button" type="button" onClick={() => remove(profile)}>删除</button></div></div>)}</div>
+    </div>}
+  </div>;
 }
 
 function Foreshadows({ work, onSaved }: { work: Work; onSaved: () => Promise<void> }) {
