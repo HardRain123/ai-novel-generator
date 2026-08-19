@@ -15,7 +15,7 @@
 
 首次启动会创建 `.env` 并生成 `APP_SECRET_KEY`。之后可直接在页面“模型设置”里保存 DeepSeek、通义千问、Kimi 或任意 OpenAI 兼容服务；API Key 会加密存储，SQLite 数据保存在 Docker volume `novel_data` 中，不会随容器重建丢失。
 
-模型设置还支持 `Codex Auth`：先在运行后端 worker 的同一台机器安装 Codex CLI 并执行 `codex login`，再在页面选择 Codex Auth、填写模型并测试连接。该方式调用本机已登录的 `codex exec`，不读取或回传 ChatGPT 浏览器 Cookie，也不使用未公开的 Codex HTTP 接口；如果使用 Docker，需要自行把 Codex CLI 和对应的 `CODEX_HOME` 凭据挂载到 worker 容器。
+模型设置还支持 `Codex Auth`：先在运行后端 worker 的同一台机器安装 Codex CLI 并执行 `codex login`，再在页面选择 Codex Auth、填写模型并测试连接。该方式调用本机已登录的 `codex exec`，不读取或回传 ChatGPT 浏览器 Cookie，也不使用未公开的 Codex HTTP 接口。Windows 主机安装 Codex CLI 时建议使用本机模式启动；Docker 容器默认看不到主机上的 Windows CLI。若后端进程找不到 CLI，可在 `.env` 设置 `CODEX_CLI_PATH` 为可执行文件路径。
 
 如果没有 Docker，脚本会尝试本机模式，但需要预先安装 Python 3.11+、Node.js 22+ 和 uv。
 

@@ -121,6 +121,9 @@ def _row(row) -> dict[str, Any] | None:
 
 
 def _codex_command() -> str | None:
+    configured = os.getenv("CODEX_CLI_PATH", "").strip()
+    if configured and os.path.isfile(configured):
+        return configured
     return shutil.which("codex") or shutil.which("codex.cmd")
 
 
@@ -133,6 +136,8 @@ def codex_auth_status() -> dict[str, Any]:
             [command, "login", "status"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
             check=False,
         )
@@ -299,7 +304,15 @@ def fetch_models(profile_id: str, user_id: str = "demo-user") -> list[str]:
         command = _codex_command()
         if not command:
             return []
-        result = subprocess.run([command, "debug", "models", "--json"], capture_output=True, text=True, timeout=30, check=False)
+        result = subprocess.run(
+            [command, "debug", "models", "--json"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
         if result.returncode != 0:
             return []
         models: list[str] = []

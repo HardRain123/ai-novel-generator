@@ -277,13 +277,24 @@ function ModelSettingsEditor({ profiles, onChanged }: { profiles: ModelProfile[]
 
 function ModelSettings({ profiles, onChanged }: { profiles: ModelProfile[]; onChanged: () => Promise<void> }) {
   const [message, setMessage] = useState("");
+  const [codexStatus, setCodexStatus] = useState<{ ok: boolean; message: string } | null>(null);
+  const loadCodexStatus = useCallback(async () => {
+    const data = await api<{ codex_auth: { ok: boolean; message: string } }>("/model-profiles");
+    setCodexStatus(data.codex_auth);
+  }, []);
+  useEffect(() => { loadCodexStatus().catch(() => undefined); }, [loadCodexStatus]);
+
+  async function refresh() {
+    await onChanged();
+    await loadCodexStatus();
+  }
 
   async function remove(profile: ModelProfile) {
     if (!window.confirm(`确定删除模型配置“${profile.name}”吗？`)) return;
     setMessage("删除中…");
     try {
       await api(`/model-profiles/${profile.id}`, { method: "DELETE" });
-      await onChanged();
+      await refresh();
       setMessage(`已删除模型配置“${profile.name}”`);
     } catch (e) {
       setMessage((e as Error).message);
@@ -291,7 +302,8 @@ function ModelSettings({ profiles, onChanged }: { profiles: ModelProfile[]; onCh
   }
 
   return <div>
-    <ModelSettingsEditor profiles={profiles} onChanged={onChanged} />
+    {codexStatus && <div className="notice">Codex CLI：{codexStatus.message}</div>}
+    <ModelSettingsEditor profiles={profiles} onChanged={refresh} />
     {message && <div className="notice">{message}</div>}
     {profiles.length > 0 && <div className="card model-delete-panel">
       <div className="toolbar"><div><h2>删除模型配置</h2><p className="subtitle">删除后该配置将从模型列表中移除，已生成的内容不受影响。</p></div></div>

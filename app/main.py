@@ -27,7 +27,7 @@ from app.services.novel_engine import engine
 from app.services.quality import quality_check as run_quality_check
 from app.services.generation_jobs import cancel_job, enqueue_job, get_job, list_jobs, retry_job
 from app.services.foreshadows import create_foreshadow, delete_foreshadow, foreshadow_stats, list_foreshadows, update_foreshadow
-from app.services.model_profiles import bootstrap_legacy_profile, create_profile, delete_profile, fetch_models, get_profile, list_profiles, preset, test_profile, update_profile
+from app.services.model_profiles import bootstrap_legacy_profile, codex_auth_status, create_profile, delete_profile, fetch_models, get_profile, list_profiles, preset, test_profile, update_profile
 from app.services.trends import SOURCE_CONFIG, analyze_trends, get_analysis, search_trends
 from app.services.repository import (
     create_work,
@@ -84,7 +84,11 @@ def health():
 
 @app.get("/api/model-profiles")
 def model_profiles():
-    return {"items": list_profiles(), "presets": {key: preset(key) for key in ("deepseek", "qwen", "kimi", "custom", "codex_auth")}}
+    return {
+        "items": list_profiles(),
+        "presets": {key: preset(key) for key in ("deepseek", "qwen", "kimi", "custom", "codex_auth")},
+        "codex_auth": codex_auth_status(),
+    }
 
 
 @app.post("/api/model-profiles")

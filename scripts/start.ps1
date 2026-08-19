@@ -18,6 +18,18 @@ if ($envText -notmatch "(?m)^APP_SECRET_KEY=.+") {
     Set-Content -LiteralPath $envFile -Value $envText -Encoding UTF8
 }
 
+$codexMode = "auto"
+if ($envText -match "(?m)^CODEX_AUTH_MODE=(.+)$") {
+    $codexMode = $Matches[1].Trim().ToLowerInvariant()
+}
+$codex = Get-Command codex -ErrorAction SilentlyContinue
+$localRuntime = (Get-Command uv -ErrorAction SilentlyContinue) -and (Get-Command node -ErrorAction SilentlyContinue) -and (Get-Command npm -ErrorAction SilentlyContinue)
+if ($codex -and $codexMode -ne "docker" -and $localRuntime) {
+    Write-Host "Codex CLI detected; starting in local mode so the backend and worker can access Codex Auth." -ForegroundColor Cyan
+    & (Join-Path $PSScriptRoot "start-local.ps1")
+    exit $LASTEXITCODE
+}
+
 $docker = Get-Command docker -ErrorAction SilentlyContinue
 if ($docker) {
     try {
