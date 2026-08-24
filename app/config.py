@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     app_secret_key: str = ""
     allow_insecure_model_urls: bool = False
     web_origin: str = "http://localhost:3000"
+    desktop_mode: bool = False
 
 
 @lru_cache
@@ -40,4 +41,5 @@ LLM_TIMEOUT_SECONDS = settings.llm_timeout_seconds
 APP_SECRET_KEY = settings.app_secret_key
 ALLOW_INSECURE_MODEL_URLS = settings.allow_insecure_model_urls
 WEB_ORIGIN = settings.web_origin
+DESKTOP_MODE = settings.desktop_mode
 

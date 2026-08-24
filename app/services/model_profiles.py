@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import json
+from threading import Lock
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -30,15 +31,22 @@ from app.config import (
     LLM_TIMEOUT_SECONDS,
 )
 from app.db import transaction
+from app.services.model_call_logs import finish_model_call, model_call_context, start_model_call
 from app.utils import json_dumps, now_iso
 
-PRESETS: dict[str, dict[str, str]] = {
+PRESETS: dict[str, dict[str, Any]] = {
     "deepseek": {"name": "DeepSeek", "base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash"},
     "qwen": {"name": "通义千问", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus"},
     "kimi": {"name": "Kimi", "base_url": "https://api.moonshot.cn/v1", "model": "kimi-k2.5"},
     "custom": {"name": "自定义 OpenAI 兼容", "base_url": "https://", "model": ""},
-    "codex_auth": {"name": "Codex Auth（本机 Codex 登录）", "base_url": "codex://local", "model": "gpt-5.6-sol"},
+    "codex_auth": {"name": "Codex Auth（本机 Codex 登录）", "base_url": "codex://local", "model": "gpt-5.6-sol", "timeout_seconds": 600},
 }
+
+# A connection test sends a fixed, tiny JSON prompt. It should prove that the
+# transport works quickly and must not reserve a worker thread for the full
+# generation timeout.
+CODEX_CONNECTION_TEST_TIMEOUT_SECONDS = 120.0
+_connection_test_lock = Lock()
 
 
 def _secret_bytes() -> bytes:
@@ -132,6 +140,8 @@ def codex_auth_status() -> dict[str, Any]:
     if not command:
         return {"ok": False, "message": "未找到 Codex CLI，请先安装 Codex CLI"}
     try:
+        from app.services.novel_engine import codex_process_env
+
         result = subprocess.run(
             [command, "login", "status"],
             capture_output=True,
@@ -140,6 +150,7 @@ def codex_auth_status() -> dict[str, Any]:
             errors="replace",
             timeout=15,
             check=False,
+            env=codex_process_env(),
         )
     except OSError as exc:
         return {"ok": False, "message": f"无法启动 Codex CLI：{exc}"}
@@ -167,11 +178,26 @@ def _get_secret(profile_id: str, user_id: str = "demo-user") -> tuple[dict[str, 
         return (dict(row), decrypt_secret(row["encrypted_api_key"]) if row else "")
 
 
-def resolve_profile(profile_id: str | None = None, work_id: str | None = None, user_id: str = "demo-user") -> dict[str, Any] | None:
+def resolve_profile(
+    profile_id: str | None = None,
+    work_id: str | None = None,
+    user_id: str = "demo-user",
+    *,
+    require_requested_profile: bool = False,
+) -> dict[str, Any] | None:
+    """Resolve a usable profile without silently changing an explicit choice.
+
+    A job may intentionally omit a profile and use the work/default model.  Once a
+    profile id has been supplied, however, falling back to another provider makes
+    the UI lie about the model that produced the text.  Callers that create jobs
+    therefore use ``require_requested_profile``.
+    """
     with transaction() as conn:
         row = None
         if profile_id:
             row = conn.execute("SELECT * FROM model_profiles WHERE id=? AND user_id=? AND enabled=1", (profile_id, user_id)).fetchone()
+            if not row and require_requested_profile:
+                raise ValueError("指定的模型配置不存在或已停用，请重新选择模型后再生成")
         if not row and work_id:
             row = conn.execute(
                 "SELECT p.* FROM works w JOIN model_profiles p ON p.id=w.model_profile_id WHERE w.id=? AND w.user_id=? AND p.enabled=1",
@@ -188,18 +214,51 @@ def resolve_profile(profile_id: str | None = None, work_id: str | None = None, u
         return result
 
 
+TASK_REASONING_EFFORT = {
+    "setup": "medium",
+    "outline": "medium",
+    "volume_outline": "medium",
+    "planning_step": "medium",
+    "planning_character_batch": "medium",
+    "chapter": "high",
+    "state_extraction": "low",
+}
+
+
+def profile_for_task(profile: dict[str, Any] | None, kind: str) -> dict[str, Any] | None:
+    """Apply product-level reasoning policy without mutating the saved profile."""
+    if not profile:
+        return None
+    result = dict(profile)
+    effort = TASK_REASONING_EFFORT.get(kind)
+    if effort:
+        result["reasoning_effort"] = effort
+    if result.get("provider") == "codex_auth":
+        # High-reasoning chapter jobs regularly need more than the old preset's
+        # 180 seconds. Keep a safety bound, but never apply the obsolete cutoff.
+        result["timeout_seconds"] = max(float(result.get("timeout_seconds") or 0), 600)
+    return result
+
+
 def create_profile(payload: dict[str, Any], user_id: str = "demo-user") -> dict[str, Any]:
     provider = payload.get("provider", "openai_compatible")
     base_url = "codex://local" if provider == "codex_auth" else normalize_base_url(payload["base_url"])
+    name = payload["name"].strip()
     now = now_iso()
     profile_id = str(uuid4())
     with transaction() as conn:
+        duplicate = conn.execute(
+            "SELECT id FROM model_profiles WHERE user_id=? AND name=? LIMIT 1",
+            (user_id, name),
+        ).fetchone()
+        if duplicate:
+            raise ValueError(f"模型配置名称已存在：{name}，请直接编辑已有配置")
         if payload.get("is_default"):
             conn.execute("UPDATE model_profiles SET is_default=0 WHERE user_id=?", (user_id,))
         conn.execute(
             """INSERT INTO model_profiles(id,user_id,name,provider,base_url,model,encrypted_api_key,reasoning_effort,
             timeout_seconds,is_default,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (profile_id, user_id, payload["name"].strip(), provider, base_url,
+            (profile_id, user_id, name, provider, base_url,
              payload["model"].strip(), encrypt_secret(payload.get("api_key", "")), payload.get("reasoning_effort", "auto"),
              payload.get("timeout_seconds", LLM_TIMEOUT_SECONDS), int(bool(payload.get("is_default"))), now, now),
         )
@@ -248,45 +307,83 @@ def _request_payload(profile: dict[str, Any], prompt: str = "返回 JSON：{\"ok
         "temperature": 0,
         "response_format": {"type": "json_object"},
     }
-    if profile.get("reasoning_effort") and profile["reasoning_effort"] != "auto":
+    provider = str(profile.get("provider") or "openai_compatible")
+    if provider in {"openai", "openai_compatible"} and profile.get("reasoning_effort") and profile["reasoning_effort"] != "auto":
         body["reasoning_effort"] = profile["reasoning_effort"]
-    if profile.get("provider") == "deepseek" and profile.get("reasoning_effort") in {"high", "xhigh"}:
+    if provider == "deepseek" and profile.get("reasoning_effort") in {"high", "xhigh"}:
         body["thinking"] = {"type": "enabled"}
     return body
 
 
 def test_profile(profile_id: str, user_id: str = "demo-user") -> dict[str, Any]:
+    if not _connection_test_lock.acquire(blocking=False):
+        raise ValueError("已有模型连接测试正在进行，请等待其完成后再试")
+    try:
+        return _test_profile(profile_id, user_id)
+    finally:
+        _connection_test_lock.release()
+
+
+def _test_profile(profile_id: str, user_id: str = "demo-user") -> dict[str, Any]:
     raw, api_key = _get_secret(profile_id, user_id)
     if not raw:
         raise ValueError("模型配置不存在")
     if raw.get("provider") == "codex_auth":
-        result = codex_auth_status()
+        login = codex_auth_status()
+        error = ""
+        if login["ok"]:
+            try:
+                from app.services.novel_engine import engine
+
+                with model_call_context(user_id=user_id, call_kind="connection_test"):
+                    probe_profile = {
+                        **raw,
+                        "timeout_seconds": min(
+                            float(raw.get("timeout_seconds") or LLM_TIMEOUT_SECONDS),
+                            CODEX_CONNECTION_TEST_TIMEOUT_SECONDS,
+                        ),
+                    }
+                    engine.probe_codex_auth(probe_profile)
+            except Exception as exc:  # noqa: BLE001
+                error = str(exc)
+        else:
+            error = login["message"]
+        ok = not error
         with transaction() as conn:
             conn.execute("UPDATE model_profiles SET last_test_status=?, last_test_error=?, last_test_at=?, updated_at=? WHERE id=? AND user_id=?",
-                         ("ok" if result["ok"] else "failed", "" if result["ok"] else result["message"], now_iso(), now_iso(), profile_id, user_id))
-        if not result["ok"]:
-            raise ValueError(result["message"])
-        return {"ok": True, "message": result["message"], "auth_mode": "codex_auth"}
+                         ("ok" if ok else "failed", error, now_iso(), now_iso(), profile_id, user_id))
+        if not ok:
+            raise ValueError(error)
+        return {"ok": True, "message": "Codex Auth 登录与模型调用均正常", "auth_mode": "codex_auth"}
     if not api_key:
         raise ValueError("请先填写 API Key")
     base_url = normalize_base_url(raw["base_url"])
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     result: dict[str, Any] = {"ok": False, "models_supported": False}
     error = ""
+    request_payload = _request_payload(raw)
+    call_id = start_model_call(raw, request_payload, call_kind="connection_test", user_id=user_id)
+    response_text = ""
+    call_finished = False
     try:
         with httpx.Client(timeout=float(raw["timeout_seconds"]), headers=headers) as client:
             models_response = client.get(f"{base_url}/models")
             if models_response.is_success:
                 result["models_supported"] = True
                 result["models"] = [item.get("id") for item in models_response.json().get("data", []) if item.get("id")]
-            response = client.post(f"{base_url}/chat/completions", json=_request_payload(raw))
+            response = client.post(f"{base_url}/chat/completions", json=request_payload)
+            response_text = response.text
             if not response.is_success:
                 error = f"HTTP {response.status_code}: {response.text[:500]}"
             else:
                 result["ok"] = True
                 result["model"] = response.json().get("model", raw["model"])
+                finish_model_call(call_id, status="success", response_text=response_text, response=response.json())
+                call_finished = True
     except Exception as exc:  # noqa: BLE001
         error = str(exc)
+    if not call_finished:
+        finish_model_call(call_id, status="failed", response_text=response_text, error=error)
     with transaction() as conn:
         conn.execute("UPDATE model_profiles SET last_test_status=?, last_test_error=?, last_test_at=?, updated_at=? WHERE id=? AND user_id=?",
                      ("ok" if result["ok"] else "failed", error, now_iso(), now_iso(), profile_id, user_id))
@@ -304,14 +401,17 @@ def fetch_models(profile_id: str, user_id: str = "demo-user") -> list[str]:
         command = _codex_command()
         if not command:
             return []
+        from app.services.novel_engine import codex_process_env
+
         result = subprocess.run(
-            [command, "debug", "models", "--json"],
+            [command, "debug", "models"],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=30,
             check=False,
+            env=codex_process_env(),
         )
         if result.returncode != 0:
             return []
@@ -324,7 +424,7 @@ def fetch_models(profile_id: str, user_id: str = "demo-user") -> list[str]:
             candidates = value if isinstance(value, list) else value.get("models", value.get("data", [])) if isinstance(value, dict) else []
             if isinstance(candidates, list):
                 for item in candidates:
-                    model_id = item.get("id") if isinstance(item, dict) else str(item)
+                    model_id = (item.get("id") or item.get("slug")) if isinstance(item, dict) else str(item)
                     if model_id and model_id not in models:
                         models.append(model_id)
         return models
@@ -337,6 +437,13 @@ def fetch_models(profile_id: str, user_id: str = "demo-user") -> list[str]:
 
 
 def bootstrap_legacy_profile(user_id: str = "demo-user") -> None:
+    # Migrate the old Codex preset value so the settings page matches the
+    # effective task timeout. Values explicitly changed to anything else stay.
+    with transaction() as conn:
+        conn.execute(
+            "UPDATE model_profiles SET timeout_seconds=600, updated_at=? WHERE user_id=? AND provider='codex_auth' AND timeout_seconds=180",
+            (now_iso(), user_id),
+        )
     if not LLM_API_KEY:
         return
     with transaction() as conn:
@@ -347,7 +454,7 @@ def bootstrap_legacy_profile(user_id: str = "demo-user") -> None:
                     "timeout_seconds": LLM_TIMEOUT_SECONDS, "is_default": True}, user_id)
 
 
-def preset(name: str) -> dict[str, str]:
+def preset(name: str) -> dict[str, Any]:
     if name not in PRESETS:
         raise ValueError("未知模型预设")
     return dict(PRESETS[name])

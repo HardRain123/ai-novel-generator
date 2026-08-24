@@ -1,0 +1,44 @@
+name: Release Windows Desktop
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            desktop/package-lock.json
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Verify tag matches app version
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $version = (Get-Content desktop/package.json -Raw | ConvertFrom-Json).version
+          if ("v$version" -ne "${{ github.ref_name }}") { throw "Git tag must be v$version, got ${{ github.ref_name }}" }
+      - name: Install Python dependencies
+        run: uv sync --dev
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: web
+      - name: Install desktop dependencies
+        run: npm ci
+        working-directory: desktop
+      - name: Publish Windows installer and update metadata
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/build-windows.ps1 -Publish

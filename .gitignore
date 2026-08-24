@@ -1,8 +1,26 @@
 .env
-data.db
+.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.bak
+backups/
+*.pem
+*.key
+*.pfx
+*.p12
 __pycache__/
 .pytest_cache/
 .venv/
 web/node_modules/
 web/.next/
+logs/
+.build/
+release/
+desktop/node_modules/
+desktop/dist/
+web/out/
+web/tsconfig.tsbuildinfo
 

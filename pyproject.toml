@@ -19,6 +19,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8,<10",
+    "pyinstaller>=6,<7",
 ]
 
 [tool.pytest.ini_options]

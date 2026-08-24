@@ -8,6 +8,8 @@ from app.config import LLM_API_KEY, LLM_MODEL
 from app.db import transaction
 from app.services.context_builder import build_context
 from app.services.novel_engine import STATE_EXTRACTOR_VERSION, engine
+from app.services.state_engine import rebuild_work_state, record_event
+from app.services.state_engine import supersede_chapter_version
 from app.utils import json_dumps, json_loads, now_iso
 
 PROMPT_VERSION = "state-extraction-v2"
@@ -44,6 +46,17 @@ def _chapter_version(conn, work_id: str, chapter: dict[str, Any], source: str) -
         (work_id, int(chapter["chapter_no"]), content_hash),
     ).fetchone()
     if existing:
+        old_versions = conn.execute(
+            "SELECT id FROM chapter_versions WHERE work_id=? AND chapter_no=? AND is_current=1 AND id<>?",
+            (work_id, int(chapter["chapter_no"]), existing["id"]),
+        ).fetchall()
+        conn.execute(
+            "UPDATE chapter_versions SET is_current=0 WHERE work_id=? AND chapter_no=? AND id<>?",
+            (work_id, int(chapter["chapter_no"]), existing["id"]),
+        )
+        conn.execute("UPDATE chapter_versions SET is_current=1,superseded_by=NULL,replaced_at=NULL WHERE id=?", (existing["id"],))
+        conn.execute("UPDATE chapters SET current_version_id=? WHERE work_id=? AND chapter_no=?", (existing["id"], work_id, int(chapter["chapter_no"])))
+        supersede_chapter_version(conn, work_id, int(chapter["chapter_no"]), [row["id"] for row in old_versions], existing["id"])
         return dict(existing)
     latest = conn.execute(
         "SELECT COALESCE(MAX(version_no), 0) AS version_no FROM chapter_versions WHERE work_id = ? AND chapter_no = ?",
@@ -60,13 +73,26 @@ def _chapter_version(conn, work_id: str, chapter: dict[str, Any], source: str) -
         "source": source,
         "created_at": now_iso(),
     }
+    old_versions = conn.execute(
+        "SELECT id FROM chapter_versions WHERE work_id=? AND chapter_no=? AND is_current=1",
+        (work_id, int(chapter["chapter_no"])),
+    ).fetchall()
+    conn.execute(
+        "UPDATE chapter_versions SET is_current=0,superseded_by=?,replaced_at=? WHERE work_id=? AND chapter_no=? AND is_current=1",
+        (version["id"], now_iso(), work_id, int(chapter["chapter_no"])),
+    )
     conn.execute(
         """
-        INSERT INTO chapter_versions(id, work_id, chapter_id, chapter_no, version_no, content, content_hash, source, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO chapter_versions(id, work_id, chapter_id, chapter_no, version_no, content, content_hash, source, created_at, is_current, fact_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
         """,
         tuple(version.values()),
     )
+    conn.execute(
+        "UPDATE chapters SET current_version_id=? WHERE work_id=? AND chapter_no=?",
+        (version["id"], work_id, int(chapter["chapter_no"])),
+    )
+    supersede_chapter_version(conn, work_id, int(chapter["chapter_no"]), [row["id"] for row in old_versions], version["id"])
     return version
 
 
@@ -129,6 +155,38 @@ def _existing_extraction(conn, version_id: str):
         """,
         (version_id, f"{STATE_EXTRACTOR_VERSION}%"),
     ).fetchone()
+
+
+def queue_pending_extraction(
+    work: dict[str, Any],
+    chapter: dict[str, Any],
+    source: str = "generation",
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create a lightweight pending record without waiting for the extractor model."""
+    with transaction() as conn:
+        version = _chapter_version(conn, work["id"], chapter, source)
+        existing = _existing_extraction(conn, version["id"])
+        if existing:
+            return _format_extraction(conn, existing["id"])
+
+        model_name = (profile or {}).get("model") or (LLM_MODEL if LLM_API_KEY else "fallback")
+        return {
+            "id": "",
+            "work_id": work["id"],
+            "chapter_version_id": version["id"],
+            "status": "queued",
+            "extractor_version": STATE_EXTRACTOR_VERSION,
+            "run_no": 1,
+            "prompt_version": PROMPT_VERSION,
+            "model": model_name,
+            "warning": "状态提取任务已排队，完成后可审核结果。",
+            "characters": [],
+            "aliases": [],
+            "timeline_events": [],
+            "foreshadows": [],
+            "job_id": "",
+        }
 
 
 def extract_and_persist(
@@ -269,6 +327,11 @@ def _apply_character_change(conn, extraction: dict[str, Any], item: dict[str, An
         "SELECT chapter_no FROM chapter_versions WHERE id = ? LIMIT 1",
         (extraction["chapter_version_id"],),
     ).fetchone()["chapter_no"]
+    plan = conn.execute(
+        "SELECT story_day FROM chapter_plans WHERE work_id=? AND chapter_no=?",
+        (extraction["work_id"], chapter_no),
+    ).fetchone()
+    story_day = plan["story_day"] if plan else None
     now = now_iso()
     if row:
         conn.execute(
@@ -286,6 +349,21 @@ def _apply_character_change(conn, extraction: dict[str, Any], item: dict[str, An
             """,
             (str(uuid4()), extraction["work_id"], character_id, json_dumps(state), chapter_no, extraction["chapter_version_id"], now),
         )
+    record_event(
+        conn, extraction["work_id"], chapter_no=chapter_no,
+        chapter_version_id=extraction["chapter_version_id"], story_day=story_day,
+        event_type="CHARACTER_STATE_CHANGED", entity_type="character", entity_id=character_id,
+        before={item["field"]: json_loads(item.get("old_value_json"), None)},
+        after={item["field"]: value}, evidence=item.get("evidence", ""),
+        confidence=float(item.get("confidence") or 0),
+        risk_level="high" if item.get("field") in {"physical_state", "secret_exposed", "faction"} else "low",
+    )
+    rebuild_work_state(conn, extraction["work_id"], chapter_no)
+    conn.execute(
+        """UPDATE chapter_plans SET stale_reason=?
+           WHERE work_id=? AND chapter_no>? AND stale_reason=''""",
+        (f"第{chapter_no}章已确认{item.get('character_name', '人物')}的{item.get('field', '状态')}变化，请复核承接", extraction["work_id"], chapter_no),
+    )
 
 
 def review_extraction(work_id: str, extraction_id: str, items: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -344,6 +422,23 @@ def review_extraction(work_id: str, extraction_id: str, items: list[dict[str, An
                     "UPDATE timeline_events SET review_status=? WHERE id=?",
                     ("confirmed" if action == "accept" else "rejected", item_id),
                 )
+                if action == "accept":
+                    chapter_no = int(row["chapter_no"] or 0)
+                    plan = conn.execute(
+                        "SELECT story_day FROM chapter_plans WHERE work_id=? AND chapter_no=? LIMIT 1",
+                        (work_id, chapter_no),
+                    ).fetchone()
+                    record_event(
+                        conn, work_id, chapter_no=chapter_no,
+                        chapter_version_id=extraction["chapter_version_id"],
+                        story_day=plan["story_day"] if plan else None,
+                        event_type="TIMELINE_EVENT_CONFIRMED", entity_type="timeline_event", entity_id=item_id,
+                        before={}, after={
+                            "title": row["title"], "description": row["description"],
+                            "location": row["location"], "participants": json_loads(row["participants_json"], []),
+                        }, evidence=row["evidence"], confidence=float(row["confidence"] or 0),
+                    )
+                    rebuild_work_state(conn, work_id, chapter_no)
             elif kind == "alias":
                 row = conn.execute(
                     "SELECT * FROM character_alias_candidates WHERE id=? AND extraction_id=? LIMIT 1",

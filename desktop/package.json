@@ -1,0 +1,50 @@
+{
+  "name": "ai-novel-generator-desktop",
+  "version": "0.2.1",
+  "private": true,
+  "description": "织梦台 Windows 单机版",
+  "main": "main.cjs",
+  "scripts": {
+    "dev": "electron .",
+    "dist": "electron-builder --win nsis --publish never",
+    "dist:publish": "electron-builder --win nsis --publish always"
+  },
+  "dependencies": {
+    "electron-updater": "^6.6.2"
+  },
+  "devDependencies": {
+    "electron": "^40.0.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.ai-novel-generator.desktop",
+    "productName": "织梦台",
+    "directories": { "output": "dist" },
+    "files": ["main.cjs", "preload.cjs", "package.json"],
+    "extraResources": [
+      { "from": "../web/out", "to": "web" },
+      { "from": "../release/backend", "to": "backend" },
+      { "from": "../release/worker", "to": "worker" }
+    ],
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "artifactName": "WeDream-Setup-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "织梦台"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "HardRain123",
+        "repo": "ai-novel-generator",
+        "releaseType": "release"
+      }
+    ]
+  }
+}
