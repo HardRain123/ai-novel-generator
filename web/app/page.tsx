@@ -324,12 +324,12 @@ export default function Home() {
     } catch (e) { setError((e as Error).message); throw e; } finally { setBusy(""); }
   }
 
-  async function generateAllCharacterBiographies(preset: string) {
+  async function generateAllCharacterBiographies(preset: string, feedback: string) {
     if (!work) return;
     setBusy("planning"); setError("");
     try {
       const queued = await api<GenerationJob>(`/works/${work.id}/planning-steps/character/generate-all`, {
-        method: "POST", body: JSON.stringify({ preset, model_profile_id: work.model_profile_id || null, idempotency_key: `planning-character-batch-${Date.now()}` }),
+        method: "POST", body: JSON.stringify({ feedback, preset, model_profile_id: work.model_profile_id || null, idempotency_key: `planning-character-batch-${Date.now()}` }),
       });
       await waitForGenerationJob(work.id, queued, setActiveJob);
       await loadPlanning(work.id); await loadWork(work.id); setActiveJob(null);
@@ -680,12 +680,12 @@ function setPlanningField(content: Record<string, any>, path: string[], value: u
 function PlanningFieldForm({ step, draftText, rules, onChange }: { step: string; draftText: string; rules: PlanningRules | null; onChange: (value: string) => void }) {
   let content: Record<string, any> | null = null;
   try { content = JSON.parse(draftText); } catch { content = null; }
-  if (!content) return <div className="notice">先生成当前步骤，或在高级 JSON 编辑区输入合法对象后再使用字段表单。</div>;
-  if (!rules) return <div className="notice">正在读取后端规划字段规则，请稍候再编辑字段表单。</div>;
+  if (!content) return <div className="notice">{draftText.trim() ? "内容格式有误，暂时无法显示编辑表单。请在高级编辑中修正，或重新生成这一步。" : "这一步还没有内容，点击下方“生成当前步骤”开始。"}</div>;
+  if (!rules) return <div className="notice">正在准备编辑内容，请稍候…</div>;
   content = normalizePlanningContent(step, content);
   const fields = planningFieldSpecs(step, content, rules);
-  if (!fields.length) return <p className="muted">当前步骤暂无可拆分字段，请使用高级 JSON 编辑区补充。</p>;
-  return <div className="planning-fields"><div className="notice">字段表单是默认编辑入口；硬限制由服务端确认阻断，建议区间仅用于写作提示。</div>{fields.map((field) => {
+  if (!fields.length) return <p className="muted">这一步暂不支持表单编辑，可展开“高级编辑”修改。</p>;
+  return <div className="planning-fields">{fields.map((field) => {
     const value = planningFieldValue(content, field.path);
     const rawValue = planningFieldRawValue(content, field.path);
     const count = Array.from(value).length;
@@ -694,7 +694,7 @@ function PlanningFieldForm({ step, draftText, rules, onChange }: { step: string;
     const outsideHardRange = field.valueType !== "number" && field.hard && hasRange && hasValue && (count < field.min! || count > field.max!);
     const missingRequired = field.valueType !== "number" && field.required && !hasValue;
     const rangeLabel = hasRange
-      ? `${field.hard ? "硬限制" : "建议"} ${field.min}—${field.max} 字`
+      ? `${field.hard ? "需填写" : "建议"} ${field.min}—${field.max} 字`
       : field.valueType === "number" ? "数字字段 · 保存时保持数字类型" : "以服务端字段规则为准";
     const update = (raw: string) => {
       const nextValue = field.valueType === "number"
@@ -709,7 +709,14 @@ function PlanningFieldForm({ step, draftText, rules, onChange }: { step: string;
       : field.multiline
       ? <textarea value={value} onChange={(event) => update(event.target.value)} />
       : <input type={field.valueType === "number" ? "number" : "text"} step={field.valueType === "number" ? 1 : undefined} value={value} onChange={(event) => update(event.target.value)} />;
-    return <div className="field" key={field.path.join(".")}><label>{field.label} <span className="muted">（{field.required === false ? "可选，" : ""}{rangeLabel}）</span></label>{input}<div className={`field-meta ${outsideHardRange || missingRequired ? "warning-text" : "muted"}`}>{field.valueType === "number" ? `${rangeLabel} · 当前值：${value || "未填写"}` : `实时字数：${count}${hasRange ? ` · ${rangeLabel}` : ""}${!field.hard && hasRange ? " · 不阻断确认" : ""}`}</div></div>;
+    const fieldStatus = missingRequired
+      ? " · 此项需要填写"
+      : outsideHardRange
+      ? ` · 确认前请调整到 ${field.min}—${field.max} 字`
+      : !field.hard && hasRange
+      ? " · 可按内容需要调整"
+      : "";
+    return <div className="field" key={field.path.join(".")}><label>{field.label} <span className="muted">（{field.required === false ? "可选，" : ""}{rangeLabel}）</span></label>{input}<div className={`field-meta ${outsideHardRange || missingRequired ? "warning-text" : "muted"}`}>{field.valueType === "number" ? `${rangeLabel} · 当前值：${value || "未填写"}` : `当前 ${count} 字${fieldStatus}`}</div></div>;
   })}</div>;
 }
 
@@ -718,7 +725,7 @@ function PlanningWizard({ work, planning, busy, onGenerate, onGenerateAllCharact
   planning: PlanningSession;
   busy: string;
   onGenerate: (step: string, itemKey: string, feedback: string, preset: string) => Promise<void>;
-  onGenerateAllCharacters: (preset: string) => Promise<void>;
+  onGenerateAllCharacters: (preset: string, feedback: string) => Promise<void>;
   onSave: (step: string, itemKey: string, content: Record<string, any>, feedback: string) => Promise<void>;
   onRestore: (snapshotId: string) => Promise<void>;
   onConfirm: (step: string, itemKey: string, candidateIndex?: number) => Promise<PlanningSession | undefined>;
@@ -855,13 +862,13 @@ function PlanningWizard({ work, planning, busy, onGenerate, onGenerateAllCharact
     <div className="card planning-main">
       <div className="toolbar"><div><h2>{step.label}</h2><p className="subtitle">{step.description}</p></div><span className={`tag ${step.status === "confirmed" ? "success" : step.status === "stale" ? "warning" : ""}`}>{PLANNING_STATUS_LABEL[step.status] || step.status}</span></div>
       {coverage && <div className="planning-coverage"><div className="toolbar"><div><strong>全书覆盖状态</strong><p className="muted">卷级主线 {coverage.planned_volume_count} 卷 · 已规划约 {coverage.planned_chapters}/{coverage.target_chapters || "?"} 章 · 覆盖率 {Math.round(coverage.coverage_ratio * 100)}%</p></div><span className={`tag ${planning.coverage_checks?.full_book_ready ? "success" : "warning"}`}>{planning.coverage_checks?.full_book_ready ? "全书可收束" : "仍需补齐"}</span></div><div className="toolbar-actions">{checkpointRows.map(([label, ready]) => <span className={`tag ${ready ? "success" : "warning"}`} key={label}>{label}：{ready ? "已覆盖" : "待补充"}</span>)}</div></div>}
-      {selectedStep === "character" && rosterList.length > 0 && <div className="planning-subitems"><div className="toolbar"><div><strong>选择要生成的人物</strong><p className="muted">待生成 {pendingCharacters.length} 位；已生成的草稿和已确认角色不会被覆盖。</p></div><button className="button primary" onClick={() => onGenerateAllCharacters(preset)} disabled={!!busy || pendingCharacters.length === 0}>{busy === "planning" ? "批量生成中…" : pendingCharacters.length ? `一键生成 ${pendingCharacters.length} 位小传` : "全部已有草稿"}</button></div><div className="toolbar-actions">{rosterList.map((item) => <button key={item.item_key} className={`button ${activeKey === item.item_key ? "primary" : ""}`} onClick={() => selectCharacter(item.item_key)}>{item.name || item.item_key}</button>)}</div></div>}
+      {selectedStep === "character" && rosterList.length > 0 && <div className="planning-subitems"><div className="toolbar"><div><strong>选择要生成的人物</strong><p className="muted">待生成 {pendingCharacters.length} 位；已生成的草稿和已确认角色不会被覆盖。</p></div><button className="button primary" onClick={() => onGenerateAllCharacters(preset, feedback)} disabled={!!busy || pendingCharacters.length === 0}>{busy === "planning" ? "批量生成中…" : pendingCharacters.length ? `一键生成 ${pendingCharacters.length} 位小传` : "全部已有草稿"}</button></div><div className="toolbar-actions">{rosterList.map((item) => <button key={item.item_key} className={`button ${activeKey === item.item_key ? "primary" : ""}`} onClick={() => selectCharacter(item.item_key)}>{item.name || item.item_key}</button>)}</div></div>}
       {selectedStep === "arc" && <div className="planning-subitems"><strong>已生成卷级主线</strong><div className="toolbar-actions">{items.map((item) => <button key={item.item_key} className={`button ${activeKey === item.item_key ? "primary" : ""}`} onClick={() => selectArc(item.item_key)}>第{item.item_key.split(":")[1] || "?"}卷</button>)}<button className="button" onClick={() => { setSelectedItemKey(nextArcKey); }}>新增第{items.length + 1}卷</button></div></div>}
       {selectedStep === "contract" && candidateList.length > 0 && <div className="planning-candidates">{candidateList.map((candidate, index) => <div className="card planning-candidate" key={`${candidate.title || "candidate"}-${index}`}><div className="toolbar"><h3>{candidate.title || `方向 ${index + 1}`}</h3><button className="button primary" onClick={() => void selectContractCandidate(index)} disabled={!!busy || hasBlockingIssues}>选择并确认</button></div><p><strong>读者体验：</strong>{candidate.target_experience}</p><p><strong>主角原则：</strong>{candidate.protagonist_principle}</p><p><strong>成长与回报：</strong>{candidate.power_curve} · {candidate.payoff_cadence}</p><p><strong>边界：</strong>{candidate.moral_boundary}</p><p><strong>禁区：</strong>{(candidate.forbidden || []).join("；")}</p></div>)}</div>}
       {selectedStep === "cast_roster" && activeItem?.content?.characters && <div className="planning-roster">{(activeItem.content.characters as Record<string, any>[]).map((item) => <div className="asset" key={item.item_key}><strong>{item.name}</strong><p>{item.role} · {item.story_function}</p><p>与主角：{item.relationship_to_protagonist}</p></div>)}</div>}
       {activeItem && <p className="muted">本步 token：{activeItem.total_tokens == null ? "未知" : `输入 ${activeItem.input_tokens || 0} · 输出 ${activeItem.output_tokens || 0} · 总计 ${activeItem.total_tokens}`}</p>}
       <PlanningFieldForm step={selectedStep} draftText={draftText} rules={planningRules} onChange={setDraftText} />
-      <details className="field"><summary>高级 JSON 编辑</summary><textarea className="planning-editor" value={draftText} onChange={(event) => setDraftText(event.target.value)} placeholder="先生成当前步骤…" /></details>
+      <details className="field"><summary>高级编辑（JSON）</summary><textarea className="planning-editor" value={draftText} onChange={(event) => setDraftText(event.target.value)} placeholder="先生成当前步骤…" /></details>
       {diff && <div className="planning-diff"><div className="toolbar"><strong>本次重生成差异</strong><div className="toolbar-actions"><button className="button primary" onClick={() => { setDiff(null); setSaveMessage("已接受本次生成结果。"); }}>接受修改</button><button className="button" onClick={() => void revertGenerated()} disabled={!!busy}>撤销</button></div></div><div className="two-col"><div><label>生成前</label><pre>{JSON.stringify(diff.before, null, 2)}</pre></div><div><label>生成后</label><pre>{JSON.stringify(diff.after, null, 2)}</pre></div></div></div>}
       {snapshots.length > 0 && <details className="planning-snapshots"><summary>版本快照（可恢复上一版）</summary>{snapshots.map((snapshot) => <div className="asset" key={snapshot.id}><div className="toolbar"><div><strong>v{snapshot.version} · {snapshot.source === "manual" ? "手动保存" : "生成结果"}</strong><p className="muted">{new Date(snapshot.created_at).toLocaleString("zh-CN")}</p></div><button className="button" disabled={!!busy} onClick={() => void onRestore(snapshot.id).then(() => setSaveMessage(`已恢复 v${snapshot.version}，当前内容成为新的草稿版本。`))}>恢复此版</button></div></div>)}</details>}
       <div className="field"><label>重生成意见（可选）</label><textarea value={feedback} onChange={(event) => setFeedback(event.target.value)} placeholder="例如：主角不能被配角教育，回报要更快，删掉道德牺牲逻辑。" /></div>

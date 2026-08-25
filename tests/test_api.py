@@ -101,7 +101,7 @@ def test_r1c_frontend_reads_field_ranges_and_marks_hard_limits_from_api():
     source = (Path(__file__).resolve().parents[1] / "web" / "app" / "page.tsx").read_text(encoding="utf-8")
     assert 'api<PlanningRules>("/planning-rules")' in source
     assert "planningFieldSpecs(step, content, rules)" in source
-    assert 'field.hard ? "硬限制" : "建议"' in source
+    assert 'field.hard ? "需填写" : "建议"' in source
     assert 'const contractFields: Array<[string, string, boolean?]>' in source
     assert "120, 260" not in source
     assert "180, 350" not in source
@@ -2259,6 +2259,9 @@ def test_r1b_frontend_planning_form_uses_canonical_paths_and_safe_editors():
     assert "JSON.parse(event.target.value)" in source
     assert 'await onSave("contract", activeKey, parsed, feedback)' in source
     assert 'await onSave(selectedStep, activeKey, parsed, feedback)' in source
+    assert "async function generateAllCharacterBiographies(preset: string, feedback: string)" in source
+    assert "JSON.stringify({ feedback, preset" in source
+    assert "onGenerateAllCharacters(preset, feedback)" in source
 
 
 def test_planning_character_check_rejects_repeated_biography():
