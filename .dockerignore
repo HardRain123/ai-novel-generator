@@ -1,0 +1,9 @@
+.git
+.venv
+__pycache__
+.pytest_cache
+data.db
+web/node_modules
+web/.next
+tests
+scratch
