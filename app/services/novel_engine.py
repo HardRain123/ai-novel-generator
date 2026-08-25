@@ -24,6 +24,8 @@ from app.services.model_call_logs import (
     finish_model_call,
     mark_model_call_first_output,
     start_model_call,
+    update_model_call_request,
+    update_model_call_status,
 )
 from app.services.prompt_settings import get_prompt_setting
 from app.services.planning_quality import (
@@ -58,6 +60,14 @@ STATE_FIELDS = {
 }
 
 PROMPT_VERSION = "novel-writing-v3"
+
+
+def _planning_context_char_counts(context: dict[str, Any]) -> dict[str, int]:
+    """Measure each projected context block for model-call observability."""
+    return {
+        key: len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+        for key, value in context.items()
+    }
 
 
 def codex_process_env() -> dict[str, str]:
@@ -323,6 +333,43 @@ def _stream_reasoning_text(chunk: Any) -> str:
 class NovelEngine:
     def __init__(self):
         self._clients: dict[str, Any] = {}
+        self._last_model_call_id: str | None = None
+        self._last_generation_meta: dict[str, Any] = {
+            "generation_source": "fallback",
+            "repair_attempts": 0,
+            "parse_status": "not_attempted",
+            "quality_status": "not_checked",
+        }
+
+    def _reset_generation_meta(self) -> None:
+        self._last_model_call_id = None
+        self._last_generation_meta = {
+            "generation_source": "fallback",
+            "repair_attempts": 0,
+            "parse_status": "not_attempted",
+            "quality_status": "not_checked",
+        }
+
+    def _set_generation_meta(
+        self,
+        *,
+        source: str,
+        repair_attempts: int,
+        parse_status: str,
+        quality_status: str = "not_checked",
+    ) -> None:
+        self._last_generation_meta = {
+            "generation_source": source,
+            "repair_attempts": repair_attempts,
+            "parse_status": parse_status,
+            "quality_status": quality_status,
+        }
+
+    def generation_metadata(self) -> dict[str, Any]:
+        return dict(self._last_generation_meta)
+
+    def last_model_call_id(self) -> str | None:
+        return self._last_model_call_id
 
     @staticmethod
     def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
@@ -364,6 +411,7 @@ class NovelEngine:
         *,
         on_progress: Callable[[str], None] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        request_metadata: dict[str, Any] | None = None,
     ) -> Any:
         """Use the officially supported local Codex CLI session, not a private HTTP endpoint."""
         command = shutil.which("codex") or shutil.which("codex.cmd")
@@ -375,16 +423,21 @@ class NovelEngine:
         response_text = ""
         model = str(profile.get("model") or "").strip()
         reasoning = str(profile.get("reasoning_effort") or "auto")
-        call_id = start_model_call(
-            profile,
-            {
-                "transport": "codex_cli",
-                "model": model,
-                "reasoning_effort": reasoning,
-                "system": system,
-                "user": user,
-            },
-        )
+        timeout_seconds = float(profile.get("timeout_seconds") or LLM_TIMEOUT_SECONDS)
+        request_payload = {
+            "transport": "codex_cli",
+            "model": model,
+            "timeout_seconds": timeout_seconds,
+            "stream": False,
+            "system": system,
+            "user": user,
+        }
+        if reasoning != "auto":
+            request_payload["reasoning_effort"] = reasoning
+        if request_metadata:
+            request_payload["observability"] = request_metadata
+        call_id = start_model_call(profile, request_payload)
+        self._last_model_call_id = call_id
         try:
             with tempfile.NamedTemporaryFile(prefix="novel-codex-", suffix=".txt", delete=False) as output:
                 output_path = output.name
@@ -433,7 +486,6 @@ class NovelEngine:
             process.stdin.write(prompt)
             process.stdin.close()
             process.stdin = None
-            timeout_seconds = float(profile.get("timeout_seconds") or LLM_TIMEOUT_SECONDS)
             started = time.monotonic()
             next_heartbeat = 0.0
             stdout = ""
@@ -469,8 +521,19 @@ class NovelEngine:
             if not content:
                 content = result.stdout.strip()
             response_text = content
-            parsed = _parse_json(content)
-            finish_model_call(call_id, status="success", response_text=content, response=parsed)
+            try:
+                parsed = _parse_json(content)
+            except json.JSONDecodeError as exc:
+                finish_model_call(
+                    call_id,
+                    status="success",
+                    response_text=content,
+                    error=exc,
+                    parse_status="failed",
+                    adoption_status="not_adopted",
+                )
+                return None
+            finish_model_call(call_id, status="success", response_text=content, response=parsed, parse_status="success")
             return parsed
         except GenerationCancelled as exc:
             finish_model_call(call_id, status="canceled", response_text=response_text, error=exc)
@@ -513,6 +576,7 @@ class NovelEngine:
         on_progress: Callable[[str], None] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
         stream: bool = True,
+        request_metadata: dict[str, Any] | None = None,
     ):
         result, _usage = self._llm_json_with_usage(
             system,
@@ -522,6 +586,7 @@ class NovelEngine:
             on_progress=on_progress,
             is_cancelled=is_cancelled,
             stream=stream,
+            request_metadata=request_metadata,
         )
         return result
 
@@ -535,31 +600,51 @@ class NovelEngine:
         on_progress: Callable[[str], None] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
         stream: bool = True,
+        request_metadata: dict[str, Any] | None = None,
     ) -> tuple[Any, dict[str, int]]:
+        self._last_model_call_id = None
         if (profile or {}).get("provider") == "codex_auth":
-            return self._codex_json(system, user, profile or {}, on_progress=on_progress, is_cancelled=is_cancelled), {}
+            return self._codex_json(
+                system,
+                user,
+                profile or {},
+                on_progress=on_progress,
+                is_cancelled=is_cancelled,
+                request_metadata=request_metadata,
+            ), {}
         api_key = (profile or {}).get("api_key") or LLM_API_KEY
         if not api_key:
             return None, {}
         base_url = (profile or {}).get("base_url") or LLM_BASE_URL
         model = (profile or {}).get("model") or LLM_MODEL
         reasoning = (profile or {}).get("reasoning_effort") or "auto"
+        timeout = (profile or {}).get("timeout_seconds") or LLM_TIMEOUT_SECONDS
+        provider = str((profile or {}).get("provider") or "openai_compatible")
+        use_stream = bool(stream and (on_progress or is_cancelled))
+        extra_body = {"thinking": {"type": "enabled"}} if provider == "deepseek" and reasoning in {"high", "xhigh"} else None
         request_payload = {
             "messages": [
                 {"role": "system", "content": system + "\n只输出合法 JSON，不要 Markdown 代码块，不要解释。"},
                 {"role": "user", "content": user},
             ],
+            "transport": "openai_stream" if use_stream else "openai",
             "model": model,
             "temperature": temperature,
-            "reasoning_effort": reasoning,
-            "stream": bool(stream and (on_progress or is_cancelled)),
+            "timeout_seconds": timeout,
+            "stream": use_stream,
         }
+        if provider in {"openai", "openai_compatible"} and reasoning != "auto":
+            request_payload["reasoning_effort"] = reasoning
+        if extra_body:
+            request_payload["extra_body"] = extra_body
+        if request_metadata:
+            request_payload["observability"] = request_metadata
         call_id = start_model_call(profile, request_payload)
+        self._last_model_call_id = call_id
         response_text = ""
         try:
             from langchain_openai import ChatOpenAI
 
-            timeout = (profile or {}).get("timeout_seconds") or LLM_TIMEOUT_SECONDS
             key_fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
             profile_key = str((profile or {}).get("id") or f"{base_url}:{model}") + f":{base_url}:{model}:{key_fingerprint}:{(profile or {}).get('reasoning_effort', 'auto')}:{temperature}"
             if profile_key not in self._clients:
@@ -571,7 +656,6 @@ class NovelEngine:
                     "timeout": timeout,
                 }
                 reasoning = (profile or {}).get("reasoning_effort") or "auto"
-                provider = str((profile or {}).get("provider") or "openai_compatible")
                 # OpenAI-style gateways commonly support reasoning_effort. Named
                 # third-party providers use their own controls, so do not send an
                 # unknown optional parameter that could reject the whole request.
@@ -584,7 +668,7 @@ class NovelEngine:
                     # request before it reaches the configured endpoint.
                     # Omit the extension entirely for normal/low reasoning.
                     if reasoning in {"high", "xhigh"}:
-                        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+                        kwargs["extra_body"] = extra_body
                 self._clients[profile_key] = ChatOpenAI(**kwargs)
             messages = [
                 ("system", system + "\n只输出合法 JSON，不要 Markdown 代码块，不要解释。"),
@@ -592,7 +676,6 @@ class NovelEngine:
             ]
             result: Any
             raw_usage: dict[str, Any] = {}
-            use_stream = stream and bool(on_progress or is_cancelled)
             if use_stream:
                 # Streaming does not expose partial JSON to the user or database;
                 # it only makes the waiting state observable and cancelable.
@@ -641,6 +724,9 @@ class NovelEngine:
                         on_progress("当前模型不支持流式输出，已切换为普通生成；请继续等待")
                     if is_cancelled and is_cancelled():
                         raise GenerationCancelled("用户已取消生成")
+                    request_payload["transport"] = "openai"
+                    request_payload["stream"] = False
+                    update_model_call_request(call_id, request_payload)
                     result = self._clients[profile_key].invoke(messages)
                     raw_usage = getattr(result, "usage_metadata", None) or {}
                 if on_progress:
@@ -666,8 +752,27 @@ class NovelEngine:
             } if input_tokens is not None and output_tokens is not None and total_tokens is not None else {}
             content = result if isinstance(result, str) else str(result.content)
             response_text = content
-            parsed = _parse_json(content)
-            finish_model_call(call_id, status="success", response_text=content, response=parsed, usage=usage)
+            try:
+                parsed = _parse_json(content)
+            except json.JSONDecodeError as exc:
+                finish_model_call(
+                    call_id,
+                    status="success",
+                    response_text=content,
+                    error=exc,
+                    parse_status="failed",
+                    adoption_status="not_adopted",
+                    usage=usage,
+                )
+                return None, usage
+            finish_model_call(
+                call_id,
+                status="success",
+                response_text=content,
+                response=parsed,
+                parse_status="success",
+                usage=usage,
+            )
             return parsed, usage
         except GenerationCancelled as exc:
             finish_model_call(call_id, status="canceled", response_text=response_text, error=exc)
@@ -681,6 +786,137 @@ class NovelEngine:
             )
             logger.exception("novel_llm_generation_failed")
             return None, {}
+
+    def _json_with_repair(
+        self,
+        system: str,
+        user: str,
+        profile: dict[str, Any] | None,
+        temperature: float,
+        *,
+        on_progress: Callable[[str], None] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+        stream: bool = True,
+        request_metadata: dict[str, Any] | None = None,
+        repair_system: str | None = None,
+        result_validator: Callable[[dict[str, Any]], bool] | None = None,
+        with_usage: bool = False,
+    ) -> tuple[Any, dict[str, int]]:
+        """Call a configured model once, then make one structural repair attempt.
+
+        A missing profile is the explicit demo mode and may use local fallback.
+        Once a profile is configured, an empty, malformed, or structurally
+        unusable JSON response must not be replaced by a local template.  The
+        second call carries the first call id in observability metadata so both
+        records remain connected to the same generation job and to each other.
+        """
+        def invoke(
+            current_system: str,
+            current_user: str,
+            current_temperature: float,
+            metadata: dict[str, Any] | None,
+        ) -> tuple[Any, dict[str, int]]:
+            try:
+                if with_usage:
+                    return self._llm_json_with_usage(
+                        current_system,
+                        current_user,
+                        profile,
+                        current_temperature,
+                        on_progress=on_progress,
+                        is_cancelled=is_cancelled,
+                        stream=stream,
+                        request_metadata=metadata,
+                    )
+                return self._llm_json(
+                    current_system,
+                    current_user,
+                    profile,
+                    current_temperature,
+                    on_progress=on_progress,
+                    is_cancelled=is_cancelled,
+                    stream=stream,
+                    request_metadata=metadata,
+                ), {}
+            except GenerationCancelled:
+                raise
+            except Exception:
+                logger.exception("novel_structured_generation_failed")
+                return None, {}
+
+        result, usage = invoke(system, user, temperature, request_metadata)
+        valid = isinstance(result, dict) and (result_validator(result) if result_validator else True)
+        if valid:
+            self._set_generation_meta(source="model", repair_attempts=0, parse_status="success")
+            return result, usage
+
+        # A saved profile or the legacy environment-key path both count as a
+        # configured model.  Only the absence of both enables demo fallback.
+        # Calling the wrapper above first keeps existing test doubles useful,
+        # while the real no-profile/no-key implementation returns (None, {}).
+        if not (profile or LLM_API_KEY):
+            self._set_generation_meta(
+                source="fallback",
+                repair_attempts=0,
+                parse_status="not_attempted" if result is None else "invalid",
+            )
+            return result, usage
+
+        original_call_id = self._last_model_call_id
+        update_model_call_status(
+            original_call_id,
+            parse_status="invalid",
+            adoption_status="not_adopted",
+            only_if_transport_status="success",
+        )
+        repair_metadata = dict(request_metadata or {})
+        if original_call_id:
+            repair_metadata["repair_of_call_id"] = original_call_id
+        repair_metadata["repair_attempt"] = 1
+        repair_metadata["repair_reason"] = "invalid_or_unusable_json"
+        try:
+            original_request: Any = json.loads(user)
+        except (TypeError, ValueError):
+            original_request = user
+        repair_user = json.dumps(
+            {
+                "task": "定向修复上一次模型响应的 JSON 结构",
+                "original_request": original_request,
+                "requirements": [
+                    "只返回一个合法 JSON 对象，不要 Markdown、解释或额外字段",
+                    "保留原任务范围、已确认事实和固定坐标，不要改写创作契约",
+                    "补齐当前 schema 所要求的结构，确保可以直接进入后续质检",
+                ],
+            },
+            ensure_ascii=False,
+        )
+        repaired, repair_usage = invoke(
+            repair_system or system,
+            repair_user,
+            min(temperature, 0.35),
+            repair_metadata,
+        )
+        repair_call_id = self._last_model_call_id
+        repaired_valid = isinstance(repaired, dict) and (result_validator(repaired) if result_validator else True)
+        if not repaired_valid:
+            update_model_call_status(
+                repair_call_id,
+                parse_status="invalid",
+                adoption_status="not_adopted",
+                only_if_transport_status="success",
+            )
+            self._set_generation_meta(
+                source="model",
+                repair_attempts=1,
+                parse_status="failed",
+            )
+            raise ValueError("模型返回无法解析或结构不完整，定向结构修复也未通过")
+
+        merged_usage: dict[str, int] = {}
+        for key in {*(usage or {}).keys(), *(repair_usage or {}).keys()}:
+            merged_usage[key] = int((usage or {}).get(key, 0)) + int((repair_usage or {}).get(key, 0))
+        self._set_generation_meta(source="model", repair_attempts=1, parse_status="repaired")
+        return repaired, merged_usage
 
     def generate_planning_step(
         self,
@@ -696,6 +932,7 @@ class NovelEngine:
         on_progress: Callable[[str], None] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[dict[str, Any], dict[str, int], str]:
+        self._reset_generation_meta()
         preset_rules = PLANNING_PRESETS.get(preset, PLANNING_PRESETS["custom"])
         schemas: dict[str, Any] = {
             "contract": {
@@ -732,7 +969,10 @@ class NovelEngine:
                 "voice": "30—70字，只写措辞、语速、句式或标志性动作习惯，不得复述外貌或性格",
                 "arc": "起点、关键转折、终点", "facets": {"可选题材维度": {"content": "仅在契约或作者反馈明确要求时填写"}},
             }},
-            "cast_roster": {"characters": [{"item_key": "character:1", "name": "真实姓名", "role": "功能和立场", "relationship_to_protagonist": "关系", "story_function": "不可替代的作用"}]},
+            "cast_roster": {
+                "description": "只包含配角、盟友和对手，不得包含主角；主角已经在 protagonist 步骤单独确认。",
+                "characters": [{"item_key": "character:1", "name": "真实姓名", "role": "功能和立场", "relationship_to_protagonist": "关系", "story_function": "不可替代的作用"}],
+            },
             "character": {"character": {
                 "name": "真实姓名", "role": "人物身份", "story_function": "该人物不可替代的剧情作用",
                 "biography": "120—220字的因果经历，只讲出身、关键经历与为何进入当前故事",
@@ -775,18 +1015,32 @@ class NovelEngine:
                 "只在创作契约、已确认设定或作者反馈明确需要时，才在 facets 中增加 romance、combat、mystery 等题材维度。"
                 if step == "character" else None
             ),
+            "cast_roster_rules": (
+                "只列配角、盟友和对手，禁止把主角姓名、主角卡或主角的剧情功能复制进 characters；"
+                "如果某人承担主角视角、主角目标或主角身份，必须从阵容中删除。"
+                if step == "cast_roster" else None
+            ),
             "author_feedback": feedback,
             "schema": schemas[step],
         }, ensure_ascii=False)
-        result, usage = self._llm_json_with_usage(
+        context_char_counts = _planning_context_char_counts(context)
+        result, usage = self._json_with_repair(
             configured_prompt("planning"),
             user,
             profile,
             0.45,
             on_progress=on_progress,
             is_cancelled=is_cancelled,
+            request_metadata={
+                "context_char_counts": context_char_counts,
+                "context_chars_total": sum(context_char_counts.values()),
+            },
+            repair_system=configured_prompt("planning"),
+            result_validator=lambda value: isinstance(value, dict),
+            with_usage=True,
         )
         if isinstance(result, dict):
+            result = self._normalize_planning_result(step, result)
             if step == "character" and target_character:
                 result["character"] = self._apply_roster_identity(self._result_character(result), target_character)
                 result.pop("candidates", None)
@@ -814,6 +1068,7 @@ class NovelEngine:
         is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[dict[str, dict[str, Any]], dict[str, int], str]:
         """Generate a roster's missing biographies in one request, preserving each roster identity."""
+        self._reset_generation_meta()
         target_characters = []
         for item_key in item_keys:
             target = self._roster_character(context, item_key)
@@ -846,19 +1101,68 @@ class NovelEngine:
             "author_feedback": feedback,
             "schema": {"characters": [{"item_key": "character:1", "character": character_schema}]},
         }, ensure_ascii=False)
-        result, usage = self._llm_json_with_usage(
+        context_char_counts = _planning_context_char_counts(context)
+
+        expected_keys = {str(item_key) for item_key in item_keys}
+        recognized_character_fields = {
+            "name", "role", "story_function", "biography", "dramatic_core",
+            "appearance", "personality", "voice", "arc", "facets",
+        }
+
+        def extract_character(item: Any) -> dict[str, Any] | None:
+            if not isinstance(item, dict) or not isinstance(item.get("item_key"), str):
+                return None
+            if "character" in item:
+                raw = item.get("character")
+                if not isinstance(raw, dict):
+                    return None
+            else:
+                # Keep accepting the legacy flat batch shape, but never treat
+                # the envelope itself as a character when it has no content.
+                raw = {key: value for key, value in item.items() if key != "item_key"}
+            if not raw:
+                return None
+            if not any(
+                key in recognized_character_fields and value not in (None, "", [], {})
+                for key, value in raw.items()
+            ):
+                return None
+            return raw
+
+        def valid_character_batch(value: dict[str, Any]) -> bool:
+            characters = value.get("characters")
+            if not isinstance(characters, list) or len(characters) != len(item_keys):
+                return False
+            seen: set[str] = set()
+            for item in characters:
+                if not isinstance(item, dict):
+                    return False
+                item_key = item.get("item_key")
+                if item_key not in expected_keys or item_key in seen:
+                    return False
+                if extract_character(item) is None:
+                    return False
+                seen.add(item_key)
+            return seen == expected_keys
+
+        result, usage = self._json_with_repair(
             configured_prompt("planning"), user, profile, 0.45,
             on_progress=on_progress, is_cancelled=is_cancelled,
+            request_metadata={
+                "context_char_counts": context_char_counts,
+                "context_chars_total": sum(context_char_counts.values()),
+            },
+            repair_system=configured_prompt("planning"),
+            result_validator=valid_character_batch,
+            with_usage=True,
         )
         generated: dict[str, dict[str, Any]] = {}
         raw_by_key: dict[str, dict[str, Any]] = {}
-        if isinstance(result, dict) and isinstance(result.get("characters"), list):
+        if isinstance(result, dict) and valid_character_batch(result):
             for item in result["characters"]:
-                if not isinstance(item, dict) or not item.get("item_key"):
-                    continue
-                raw = item.get("character") if isinstance(item.get("character"), dict) else item
-                if isinstance(raw, dict):
-                    raw_by_key[str(item["item_key"])] = raw
+                raw = extract_character(item)
+                if raw is not None:
+                    raw_by_key[item["item_key"]] = raw
         source = "model" if raw_by_key else "fallback"
         for target in target_characters:
             item_key = str(target["item_key"])
@@ -869,6 +1173,38 @@ class NovelEngine:
                 fallback = self._planning_fallback(work, "character", item_key, context, preset, 1)
                 generated[item_key] = self._apply_roster_identity(dict(fallback.get("character") or {}), target)
         return generated, usage, source
+
+    @staticmethod
+    def _normalize_planning_result(step: str, result: dict[str, Any]) -> dict[str, Any]:
+        """Promote a single non-contract candidate to the requested step shape.
+
+        Some OpenAI-compatible models wrap every response in ``candidates`` even
+        when the prompt asks for a single setting, arc, or summary.  Persisting
+        that provider-specific wrapper makes validation and finalization read an
+        empty object, so normalize it at the model boundary.
+        """
+        if step == "contract":
+            return result
+        section_by_step = {
+            "setting": "story_bible",
+            "protagonist": "character",
+            "cast_roster": "characters",
+            "character": "character",
+            "arc": "arc",
+            "summary": "story_bible",
+        }
+        section = section_by_step.get(step)
+        if not section or result.get(section):
+            return result
+        candidates = []
+        if isinstance(result.get("selected"), dict):
+            candidates.append(result["selected"])
+        if isinstance(result.get("candidates"), list):
+            candidates.extend(item for item in result["candidates"] if isinstance(item, dict))
+        for candidate in candidates:
+            if candidate.get(section):
+                return dict(candidate)
+        return result
 
     @staticmethod
     def _result_character(result: dict[str, Any]) -> dict[str, Any]:
@@ -1117,6 +1453,7 @@ class NovelEngine:
         }
 
     def generate_setup(self, work: dict[str, Any], profile: dict[str, Any] | None = None) -> dict[str, Any]:
+        self._reset_generation_meta()
         fallback = normalize_setup(work, self.setup(work))
         schema = {
             "story_bible": {
@@ -1138,7 +1475,7 @@ class NovelEngine:
             }],
             "plot_arcs": [{"title": "", "synopsis": "起点、关键因果、关系变化、代价和结束状态", "sequence": 1}],
         }
-        result = self._llm_json(
+        result, _usage = self._json_with_repair(
             configured_prompt("setup"),
             json.dumps(
                 {
@@ -1156,18 +1493,39 @@ class NovelEngine:
                 },
                 ensure_ascii=False,
             ), profile, 0.5,
+            repair_system=configured_prompt("setup_repair"),
+            result_validator=lambda value: bool(value.get("story_bible")),
         )
+        initial_model_call_id = self._last_model_call_id
         model_output = isinstance(result, dict) and bool(result.get("story_bible"))
         output = normalize_setup(work, result) if model_output else fallback
         issues, score = evaluate_setup(work, output)
+        if model_output:
+            update_model_call_status(
+                initial_model_call_id,
+                quality_status="failed" if issues else "passed",
+            )
         if model_output and issues:
+            quality_repair_parent = self._last_model_call_id
+            self._last_generation_meta["repair_attempts"] = int(self._last_generation_meta.get("repair_attempts") or 0) + 1
             repaired = self._llm_json(
                 configured_prompt("setup_repair"),
                 json.dumps({"work": work, "draft": output, "quality_issues": issues, "schema": schema}, ensure_ascii=False),
                 profile, 0.35,
+                request_metadata={
+                    **({"repair_of_call_id": quality_repair_parent} if quality_repair_parent else {}),
+                    "repair_attempt": self._last_generation_meta["repair_attempts"],
+                    "repair_reason": "quality_gate",
+                },
             )
+            quality_repair_call_id = self._last_model_call_id
             repaired_output = normalize_setup(work, repaired)
             repaired_issues, repaired_score = evaluate_setup(work, repaired_output)
+            if quality_repair_call_id and isinstance(repaired, dict):
+                update_model_call_status(
+                    quality_repair_call_id,
+                    quality_status="failed" if repaired_issues else "passed",
+                )
             if repaired_score > score:
                 output, issues, score = repaired_output, repaired_issues, repaired_score
         if model_output and issues:
@@ -1175,6 +1533,9 @@ class NovelEngine:
         output["generation_source"] = "model" if model_output else "fallback"
         output["quality_score"] = score
         output["quality_issues"] = issues
+        self._last_generation_meta["generation_source"] = output["generation_source"]
+        self._last_generation_meta["quality_status"] = "passed" if not issues else "failed"
+        output.update(self.generation_metadata())
         output["prompt_version"] = PROMPT_VERSION
         return output
 
@@ -1273,6 +1634,7 @@ class NovelEngine:
         so a model cannot silently turn a 40-chapter volume into a 12-chapter
         one (or move a stage while trying to improve prose).
         """
+        self._reset_generation_meta()
         volume = next((item for item in work.get("story_volumes", []) if item.get("id") == volume_id), None)
         if not volume:
             raise ValueError("指定分卷不存在")
@@ -1309,7 +1671,7 @@ class NovelEngine:
             {key: item.get(key, "") for key in ("name", "role", "story_function", "goal", "conflict", "status", "arc", "character_arc")}
             for item in (work.get("characters") or [])
         ]
-        result, usage = self._llm_json_with_usage(
+        result, usage = self._json_with_repair(
             configured_prompt("volume_outline"),
             json.dumps({
                 "task": "重写指定叙事阶段" if target_stage_id else "生成整卷卷纲草稿",
@@ -1373,6 +1735,9 @@ class NovelEngine:
             0.45,
             on_progress=on_progress,
             is_cancelled=is_cancelled,
+            repair_system=configured_prompt("outline_repair"),
+            result_validator=lambda value: isinstance(value, dict),
+            with_usage=True,
         )
 
         issues: list[dict[str, str]] = []
@@ -1458,13 +1823,25 @@ class NovelEngine:
             if not self._outline_text(stage.get("purpose")):
                 issues.append(self._volume_outline_issue(scope, "阶段任务仍为空，请作者补充。"))
 
+        quality_ok = not any(item["severity"] == "error" for item in issues)
+        self._last_generation_meta["generation_source"] = source
+        self._last_generation_meta["quality_status"] = (
+            "passed" if source == "model" and quality_ok
+            else "failed" if source == "model"
+            else "not_checked"
+        )
+        update_model_call_status(
+            self._last_model_call_id,
+            quality_status=self._last_generation_meta["quality_status"],
+        )
         return {
             "volume": draft_volume,
             "stages": draft_stages,
             "target_stage_id": target_stage_id,
             "quality_issues": issues,
-            "quality_ok": not any(item["severity"] == "error" for item in issues),
+            "quality_ok": quality_ok,
             "generation_source": source,
+            **self.generation_metadata(),
             "prompt_version": PROMPT_VERSION,
         }, usage, source
 
@@ -1476,6 +1853,7 @@ class NovelEngine:
         *,
         generation_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self._reset_generation_meta()
         readiness = outline_readiness_issues(work)
         if readiness:
             raise ValueError("暂不能生成章节大纲：" + "；".join(readiness) + "。请先重新生成或补全故事方案。")
@@ -1570,11 +1948,13 @@ class NovelEngine:
             },
             ensure_ascii=False,
         )
-        result = self._llm_json(
+        result, _usage = self._json_with_repair(
             configured_prompt("outline"),
             user, profile, 0.45,
+            repair_system=configured_prompt("outline_repair"),
+            result_validator=lambda value: isinstance(value.get("chapters"), list),
         )
-        items = normalize_outline(result) if result is not None else fallback_items
+        items = normalize_outline(result) if isinstance(result, dict) else fallback_items
         # Some OpenAI-compatible models number a local batch from 1 despite an
         # absolute-range instruction.  The item order remains meaningful, so
         # normalize that harmless transport error before quality validation.
@@ -1586,17 +1966,126 @@ class NovelEngine:
         # Saving the first complete model response prevents a long retry from
         # discarding every usable chapter merely because one optional field is
         # weak.  Hard story-state conflicts remain enforced by the job layer.
+        source = self._last_generation_meta.get("generation_source") or ("model" if isinstance(result, dict) else "fallback")
+        self._last_generation_meta["generation_source"] = source
+        self._last_generation_meta["quality_status"] = "passed" if source == "model" and not issues else ("failed" if source == "model" else "not_checked")
+        update_model_call_status(
+            self._last_model_call_id,
+            quality_status=self._last_generation_meta["quality_status"],
+        )
         return {
             "chapters": items,
-            "generation_source": "model" if result is not None else "fallback",
+            **self.generation_metadata(),
             "quality_score": score,
             "quality_issues": issues,
             "prompt_version": PROMPT_VERSION,
         }
 
+    def repair_outline_chapters(
+        self,
+        work: dict[str, Any],
+        failed_chapters: list[dict[str, Any]],
+        issues_by_chapter: dict[str, list[str]],
+        profile: dict[str, Any] | None = None,
+        *,
+        generation_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Repair only failed chapter contracts, preserving the original batch."""
+        self._reset_generation_meta()
+        generation_context = generation_context or {}
+        target_numbers = [int(item.get("chapter_no") or 0) for item in failed_chapters]
+        fixed_phase_keys = [
+            {"phase_key": phase.get("phase_key"), "name": phase.get("name")}
+            for phase in (work.get("story_phases") or [])
+            if str(phase.get("phase_key") or "").strip()
+        ]
+        schema = {
+            "chapters": [{
+                "chapter_no": "必须原样使用 target_chapter_numbers 中的数字",
+                "title": "具体章节标题",
+                "pov_character": "必须使用人物小传中的姓名",
+                "goal": "本章可执行目标",
+                "conflict": "本章具体冲突",
+                "failure_cost": "失败造成的具体代价",
+                "beats": ["5至8个可直接写成场景的情节点"],
+                "hook": "结尾形成的新局面",
+                "plot_arc": "必须填写所属卷级主线标题",
+                "opening_state": {"time": "", "location": "", "carry_over_action": ""},
+                "ending_state": {"location": "", "new_problem": "", "next_action": ""},
+                "causal_beats": [{"cause": "", "action": "", "obstacle": "", "consequence": ""}],
+                "appearing_characters": [""],
+                "appearing_factions": [],
+                "task_progress": [{"task": "", "progress": ""}],
+                "title_promise_progress": "",
+                "character_arc_progress": "",
+                "story_day": 0,
+                "phase_key": "必须逐字使用 fixed_phase_keys 中的 phase_key；不能创造阶段名",
+                "time_mode": "linear|flashback|parallel",
+                "previous_chapter_no": 0,
+            }],
+        }
+        result, _usage = self._json_with_repair(
+            configured_prompt("outline_repair"),
+            json.dumps({
+                "task": "只修复失败的章节大纲，不重写未失败章节",
+                "target_chapter_numbers": target_numbers,
+                "absolute_chapter_range": generation_context.get("absolute_chapter_range") or {
+                    "from_chapter": min(target_numbers or [1]),
+                    "to_chapter": max(target_numbers or [1]),
+                },
+                "total_target_chapters": generation_context.get("total_target_chapters") or work.get("target_chapter_count"),
+                "fixed_phase_keys": fixed_phase_keys,
+                "story_bible": work.get("story_bible") or {},
+                "characters": [
+                    {key: item.get(key, "") for key in ("name", "role", "goal", "conflict", "character_arc")}
+                    for item in (work.get("characters") or [])
+                ],
+                "plot_arcs": [
+                    {key: item.get(key, "") for key in ("sequence", "title", "synopsis")}
+                    for item in (work.get("plot_arcs") or [])
+                ],
+                "story_phases": work.get("story_phases") or [],
+                "narrative_stages": generation_context.get("narrative_stages") or work.get("narrative_stages") or [],
+                "failed_chapters": failed_chapters,
+                "issues_by_chapter": issues_by_chapter,
+                "requirements": [
+                    "只返回 target_chapter_numbers 中的章节，数量和编号必须完全一致",
+                    "只修改列出问题的章节字段，不改变已确认人物、主线、阶段和时间坐标",
+                    "phase_key 只能从 fixed_phase_keys 选择；若没有阶段列表，使用 default",
+                ],
+                "schema": schema,
+            }, ensure_ascii=False),
+            profile,
+            0.35,
+            repair_system=configured_prompt("outline_repair"),
+            result_validator=lambda value: isinstance(value.get("chapters"), list) and len(value["chapters"]) == len(target_numbers),
+        )
+        items = normalize_outline(result) if isinstance(result, dict) else []
+        if len(items) == len(target_numbers):
+            numbers = [item.get("chapter_no") for item in items]
+            local_numbers = list(range(1, len(target_numbers) + 1))
+            if numbers == local_numbers or all(not int(number or 0) for number in numbers):
+                for index, item in enumerate(items):
+                    item["chapter_no"] = target_numbers[index]
+        source = self._last_generation_meta.get("generation_source") or ("model" if isinstance(result, dict) else "fallback")
+        self._last_generation_meta["generation_source"] = source
+        self._last_generation_meta["quality_status"] = "passed" if source == "model" and len(items) == len(target_numbers) else "failed"
+        update_model_call_status(
+            self._last_model_call_id,
+            quality_status=self._last_generation_meta["quality_status"],
+        )
+        return {
+            "chapters": items,
+            "target_chapter_numbers": target_numbers,
+            "issues_by_chapter": issues_by_chapter,
+            "generation_source": source,
+            **self.generation_metadata(),
+        }
+
     def generate_trend_ideas(self, items: list[dict[str, Any]], profile: dict[str, Any] | None = None) -> dict[str, Any]:
+        self._reset_generation_meta()
         compact = [{key: item.get(key, "") for key in ("id", "title", "author", "category", "synopsis", "rank", "source")} for item in items]
-        result = self._llm_json(
+        result, _usage = self._json_with_repair(
             configured_prompt("trend"),
             json.dumps({
                 "task": "热门网文作品模型与原创灵感蓝图",
@@ -1615,12 +2104,15 @@ class NovelEngine:
                     }],
                 },
             }, ensure_ascii=False), profile,
+            result_validator=lambda value: bool(value.get("ideas")) and isinstance(value.get("ideas"), list),
         )
         if isinstance(result, dict) and isinstance(result.get("ideas"), list) and result["ideas"]:
             result["ideas"] = result["ideas"][:5]
+            result.update(self.generation_metadata())
             return result
         titles = [str(item.get("title", "热门作品")) for item in items[:3]]
         return {
+            **self.generation_metadata(),
             "trend_summary": "当前榜单显示，读者偏好集中在强冲突、明确目标和持续悬念。",
             "rising_themes": ["高概念开局", "关系冲突", "连续悬念"],
             "overcrowded_directions": ["直接套用热门书名或人物关系", "只替换背景的同质化设定"],
@@ -1712,6 +2204,7 @@ class NovelEngine:
 
     def extract_state_changes(self, work: dict[str, Any], chapter: dict[str, Any], profile: dict[str, Any] | None = None) -> dict[str, Any]:
         """只提取本章明确证据，结果用于审核，不直接写入正式状态。"""
+        self._reset_generation_meta()
         content = str(chapter.get("content", "")).strip()
         chapter_context = build_context(work, int(chapter.get("chapter_no") or 0))
         context_by_name = {item.get("name"): item for item in chapter_context.get("characters", [])}
@@ -1723,7 +2216,7 @@ class NovelEngine:
             | {"previous_confirmed_state": context_by_name.get(item.get("name"), {}).get("confirmed_state", {})}
             for item in work.get("characters", [])
         ]
-        result = self._llm_json(
+        result, _usage = self._json_with_repair(
             configured_prompt("extraction"),
             json.dumps({
                 "task": "从本章正文提取可审核的作品状态变化",
@@ -1740,6 +2233,7 @@ class NovelEngine:
                     "warnings": [],
                 },
             }, ensure_ascii=False), profile, 0.1,
+            result_validator=lambda value: isinstance(value, dict),
         )
         if result is None:
             first_sentence = next((line.strip() for line in content.replace("。", "。\n").splitlines() if line.strip()), "")
@@ -1763,7 +2257,9 @@ class NovelEngine:
                     "当前未配置 LLM，使用本地低置信度提取；建议配置模型后重新提取。"
                 ],
             }
-        return self._normalize_extraction(result, chapter)
+        normalized = self._normalize_extraction(result, chapter)
+        normalized.update(self.generation_metadata())
+        return normalized
 
     def _write_chapter(
         self,
@@ -1776,6 +2272,7 @@ class NovelEngine:
         on_progress: Callable[[str], None] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
+        self._reset_generation_meta()
         plan = next(
             (item for item in work.get("chapter_plans", []) if item.get("chapter_no") == chapter_no),
             None,
@@ -1808,7 +2305,7 @@ class NovelEngine:
             "他没有急着解释，只先确认手里能用的东西和对方已经知道的部分。"
             f"\n\n事情留下了一个必须在下一步处理的后果：{plan.get('hook') or '一个新的问题摆到了面前'}。"
         )
-        result = self._llm_json(
+        result, _usage = self._json_with_repair(
             configured_prompt("chapter"),
             json.dumps(
                 {
@@ -1830,6 +2327,7 @@ class NovelEngine:
             # The editor does not render token deltas.  A complete response is
             # more reliable for long JSON chapters and preserves Thinking.
             stream=False,
+            result_validator=lambda value: bool(value.get("content")),
         )
         if isinstance(result, dict) and result.get("content"):
             return {
@@ -1838,7 +2336,7 @@ class NovelEngine:
                 "content": result["content"],
                 "continuity_warnings": result.get("continuity_warnings", []),
                 "context_audit_id": context_audit_id,
-                "generation_source": "llm",
+                **self.generation_metadata(),
                 "prompt_version": PROMPT_VERSION,
             }
         return {
@@ -1847,7 +2345,7 @@ class NovelEngine:
             "content": fallback_content,
             "continuity_warnings": ["模型未返回正文，使用本地 fallback。"],
             "context_audit_id": context_audit_id,
-            "generation_source": "fallback",
+            **self.generation_metadata(),
             "prompt_version": PROMPT_VERSION,
         }
 
@@ -1934,6 +2432,9 @@ class NovelEngine:
                 "content": str(data.get("content") or "").strip(),
                 "continuity_warnings": data.get("continuity_warnings") if isinstance(data.get("continuity_warnings"), list) else [],
                 "generation_source": data.get("generation_source", "unknown"),
+                "repair_attempts": int(data.get("repair_attempts") or 0),
+                "parse_status": data.get("parse_status", "not_checked"),
+                "quality_status": data.get("quality_status", "not_checked"),
                 "editor_notes": data.get("editor_notes") if isinstance(data.get("editor_notes"), list) else [],
             }
             return {**state, "data": normalized}

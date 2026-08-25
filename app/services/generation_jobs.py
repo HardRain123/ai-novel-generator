@@ -7,10 +7,15 @@ from uuid import uuid4
 
 from app.db import transaction
 from app.services.novel_engine import GenerationCancelled, engine
-from app.services.model_call_logs import reset_model_call_context, set_model_call_context
+from app.services.model_call_logs import (
+    finalize_generation_job_adoption,
+    reset_model_call_context,
+    set_model_call_context,
+    update_model_call_status,
+)
 from app.services.model_profiles import profile_for_task, resolve_profile
 from app.services.planning_quality import character_batch_checks, planning_checks
-from app.services.planning_repository import confirmed_context, upsert_artifact
+from app.services.planning_repository import confirmed_context, planning_context_for_step, upsert_artifact
 from app.services.quality import quality_check
 from app.services.repository import ensure_long_form_structure, get_work, save_chapter, save_outline, save_quality_report, save_story_setup
 from app.services.story_state import validate_chapter_generation, validate_chapter_plan
@@ -34,18 +39,22 @@ def _row(row) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def _planning_context(work: dict[str, Any]) -> dict[str, Any]:
+def _planning_context(work: dict[str, Any], step: str | None = None, item_key: str | None = None) -> dict[str, Any]:
     """Merge confirmed author decisions with an abstract inspiration brief.
 
     The brief deliberately excludes provenance titles and other source surface
     details.  It can guide market fit and pacing while the planning prompts still
     generate a genuinely new story world, cast and event chain.
     """
-    context = confirmed_context(work["id"])
+    context = (
+        planning_context_for_step(work["id"], step, item_key)
+        if step
+        else confirmed_context(work["id"])
+    )
     blueprint = work.get("inspiration_blueprint") or {}
     content = blueprint.get("content") if isinstance(blueprint, dict) else {}
     brief = content.get("creative_brief") if isinstance(content, dict) else None
-    if isinstance(brief, dict):
+    if isinstance(brief, dict) and step != "summary":
         context["inspiration_brief"] = brief
         context["originality_requirements"] = (
             (blueprint.get("originality") or {}).get("checks", [])
@@ -60,6 +69,16 @@ def _job_result(row) -> dict[str, Any]:
     result["output"] = json_loads(result.pop("output_json"), {})
     result["metrics"] = json_loads(result.pop("metrics_json", "{}"), {})
     return result
+
+
+def _generation_meta() -> dict[str, Any]:
+    meta = engine.generation_metadata()
+    return {
+        "generation_source": str(meta.get("generation_source") or "fallback"),
+        "repair_attempts": int(meta.get("repair_attempts") or 0),
+        "parse_status": str(meta.get("parse_status") or "not_checked"),
+        "quality_status": str(meta.get("quality_status") or "not_checked"),
+    }
 
 
 def get_job(job_id: str, work_id: str | None = None) -> dict[str, Any] | None:
@@ -398,6 +417,7 @@ def _cancel_if_requested(job_id: str) -> bool:
             "UPDATE generation_jobs SET status='canceled', stage='completed', stage_label='已取消', message='已取消，未保存本次生成结果', completed_at=?, updated_at=? WHERE id=? AND status='cancel_requested'",
             (now_iso(), now_iso(), job_id),
         )
+    finalize_generation_job_adoption(job_id)
     return True
 
 
@@ -415,8 +435,15 @@ def cancel_job(job_id: str, work_id: str) -> dict[str, Any] | None:
     return get_job(job_id, work_id)
 
 
-def _complete(job_id: str, output: dict[str, Any], usage: dict[str, int] | None = None) -> None:
+def _complete(
+    job_id: str,
+    output: dict[str, Any],
+    usage: dict[str, int] | None = None,
+    *,
+    adopted_call_id: str | None = None,
+) -> None:
     usage = usage or {}
+    finalize_generation_job_adoption(job_id, adopted_call_id)
     with transaction() as conn:
         row = conn.execute("SELECT created_at, started_at, model_started_at, model_first_output_at FROM generation_jobs WHERE id=?", (job_id,)).fetchone()
         finished_at = now_iso()
@@ -450,6 +477,7 @@ def _complete(job_id: str, output: dict[str, Any], usage: dict[str, int] | None 
 
 
 def _fail(job_id: str, error: str) -> None:
+    finalize_generation_job_adoption(job_id)
     with transaction() as conn:
         row = conn.execute("SELECT created_at, started_at, model_started_at, model_first_output_at FROM generation_jobs WHERE id=?", (job_id,)).fetchone()
         finished_at = now_iso()
@@ -509,7 +537,9 @@ def run_job(job: dict[str, Any]) -> None:
                 save_story_setup(conn, work["id"], data)
                 _record_generation(conn, work["id"], "story_setup", payload, data)
                 conn.execute("UPDATE works SET status='planning', updated_at=? WHERE id=?", (now_iso(), work["id"]))
-            output = {"kind": "story_setup", "data": data}
+            output = {"kind": "story_setup", "data": data, **{
+                key: data.get(key) for key in ("generation_source", "repair_attempts", "parse_status", "quality_status")
+            }}
         elif kind == "outline":
             ensure_lifecycle_candidates(work["id"])
             ensure_long_form_structure(
@@ -527,20 +557,23 @@ def run_job(job: dict[str, Any]) -> None:
                 if errors:
                     raise ValueError("；".join(errors))
                 validation_work["chapter_plans"].append(item)
+            outline_meta = _generation_meta()
+            data.update(outline_meta)
             if _cancel_if_requested(job["id"]):
                 return
             update_stage(job["id"], "validating", "正在检查章节数量和结构")
             with transaction() as conn:
                 saved = save_outline(
                     conn, work["id"], data.get("chapters", []), mode=data["mode"],
-                    from_chapter=data["from_chapter"], to_chapter=data["to_chapter"], request=payload,
+                    from_chapter=data["from_chapter"], to_chapter=data["to_chapter"],
+                    request={**payload, **({"repair_history": data["repair_history"]} if data.get("repair_history") else {})},
                     expected_outline_version=payload.get("expected_outline_version"),
                     expected_fact_version=data["fact_version"] if payload.get("expected_fact_version") is None else payload.get("expected_fact_version"),
                 )
                 data.update(saved)
                 _record_generation(conn, work["id"], "outline", payload, data)
                 conn.execute("UPDATE works SET status='planning', target_chapter_count=?, updated_at=? WHERE id=?", (data["total_target_chapters"], now_iso(), work["id"]))
-            output = {"kind": "outline", "data": data}
+            output = {"kind": "outline", "data": data, **outline_meta}
         elif kind == "volume_outline":
             # A volume draft is deliberately not persisted here.  The author reviews
             # the returned draft in the editor and explicitly saves it afterwards.
@@ -575,6 +608,7 @@ def run_job(job: dict[str, Any]) -> None:
                 "data": data,
                 "usage": usage,
                 "generation_source": source,
+                **_generation_meta(),
             }
             job["usage"] = usage
         elif kind == "chapter":
@@ -603,17 +637,24 @@ def run_job(job: dict[str, Any]) -> None:
             updated_work = get_work(work["id"])
             chapter = next(item for item in updated_work["chapters"] if item["chapter_no"] == chapter_no)
             extraction = enqueue_state_extraction(updated_work, chapter, "generation", profile=profile)
-            output = {"kind": "chapter", "data": data, "quality": {"score": score, "issues": issues}, "state_extraction": extraction}
+            chapter_meta = _generation_meta()
+            chapter_meta["quality_status"] = "passed" if not issues else "failed"
+            update_model_call_status(
+                engine.last_model_call_id(),
+                quality_status=chapter_meta["quality_status"],
+            )
+            data.update(chapter_meta)
+            output = {"kind": "chapter", "data": data, "quality": {"score": score, "issues": issues}, "state_extraction": extraction, **chapter_meta}
         elif kind == "state_extraction":
             chapter_no = int(payload["chapter_no"])
             chapter = next((item for item in work.get("chapters", []) if item.get("chapter_no") == chapter_no), None)
             if not chapter:
                 raise ValueError("章节不存在")
-            output = extract_and_persist(work, chapter, payload.get("source", "job"), force=bool(payload.get("force")), profile=profile)
+            output = {**extract_and_persist(work, chapter, payload.get("source", "job"), force=bool(payload.get("force")), profile=profile), **_generation_meta()}
         elif kind == "planning_step":
             step = str(payload.get("step") or "")
             item_key = str(payload.get("item_key") or "default")
-            context = _planning_context(work)
+            context = _planning_context(work, step, item_key)
             data, usage, source = engine.generate_planning_step(
                 work,
                 step,
@@ -630,18 +671,24 @@ def run_job(job: dict[str, Any]) -> None:
                 return
             update_stage(job["id"], "validating", "正在检查当前步骤结构和语言风险")
             checks = planning_checks(step, data, context)
+            planning_meta = _generation_meta()
+            planning_meta["quality_status"] = "passed" if checks.get("ok") else "failed"
+            update_model_call_status(
+                engine.last_model_call_id(),
+                quality_status=planning_meta["quality_status"],
+            )
             upsert_artifact(
                 work["id"], step, item_key, data, source=source,
                 feedback=str(payload.get("feedback") or ""), checks=checks,
                 usage=usage, model=str((profile or {}).get("model") or ""),
             )
-            output = {"kind": "planning_step", "step": step, "item_key": item_key, "data": data, "checks": checks, "usage": usage, "generation_source": source}
+            output = {"kind": "planning_step", "step": step, "item_key": item_key, "data": data, "checks": checks, "usage": usage, **planning_meta}
             job["usage"] = usage
         elif kind == "planning_character_batch":
             item_keys = list(dict.fromkeys(str(item) for item in payload.get("item_keys", []) if str(item)))
             if not item_keys:
                 raise ValueError("没有需要生成的人物")
-            context = _planning_context(work)
+            context = _planning_context(work, "character")
             drafts, usage, source = engine.generate_character_batch(
                 work,
                 item_keys,
@@ -655,8 +702,16 @@ def run_job(job: dict[str, Any]) -> None:
             if _cancel_if_requested(job["id"]):
                 return
             update_stage(job["id"], "validating", "正在检查批量人物小传")
+            if set(drafts) != set(item_keys) or any(not isinstance(drafts.get(item_key), dict) for item_key in item_keys):
+                raise ValueError("批量人物模型结果与请求人物集合不一致，未保存任何人物草稿")
             checks_by_key = character_batch_checks(drafts, context)
             invalid_keys = [item_key for item_key in item_keys if checks_by_key[item_key]["blocking"]]
+            batch_meta = _generation_meta()
+            batch_meta["quality_status"] = "failed" if invalid_keys else "passed"
+            update_model_call_status(
+                engine.last_model_call_id(),
+                quality_status=batch_meta["quality_status"],
+            )
             # Only retry the failing cards once.  This retains bulk speed for the
             # normal path while preventing a whole batch from being saved with
             # copied fields or inadequate visual detail.
@@ -686,6 +741,14 @@ def run_job(job: dict[str, Any]) -> None:
                     drafts.update(repaired)
                     usage = _merge_usage(usage, repair_usage)
                     checks_by_key = character_batch_checks(drafts, context)
+                    batch_meta = _generation_meta()
+                    batch_meta["repair_attempts"] = int(batch_meta.get("repair_attempts") or 0) + 1
+                    batch_meta["parse_status"] = "repaired"
+                    batch_meta["quality_status"] = "failed" if any(item["blocking"] for item in checks_by_key.values()) else "passed"
+                    update_model_call_status(
+                        engine.last_model_call_id(),
+                        quality_status=batch_meta["quality_status"],
+                    )
             usage_by_item = _split_usage(usage, len(item_keys))
             saved_items = []
             for index, item_key in enumerate(item_keys, start=1):
@@ -707,7 +770,7 @@ def run_job(job: dict[str, Any]) -> None:
                 update_character_batch_progress(job["id"], index, len(item_keys))
             output = {
                 "kind": "planning_character_batch", "items": saved_items,
-                "usage": usage, "generation_source": source,
+                "usage": usage, **batch_meta,
             }
             job["usage"] = usage
         else:
@@ -715,10 +778,27 @@ def run_job(job: dict[str, Any]) -> None:
         if is_cancel_requested(job["id"]):
             with transaction() as conn:
                 conn.execute("UPDATE generation_jobs SET status='canceled', stage='completed', stage_label='已取消', completed_at=?, updated_at=? WHERE id=?", (now_iso(), now_iso(), job["id"]))
+            finalize_generation_job_adoption(job["id"])
             return
         update_stage(job["id"], "saving", "正在保存生成结果")
-        _complete(job["id"], output, job.get("usage") or output.get("usage") or {})
+        quality_status = str(
+            output.get("quality_status")
+            or ((output.get("data") or {}).get("quality_status") if isinstance(output.get("data"), dict) else "")
+            or "not_checked"
+        )
+        adopted_call_id = (
+            None
+            if kind == "volume_outline" or quality_status in {"failed", "error", "quality_failed"}
+            else engine.last_model_call_id()
+        )
+        _complete(
+            job["id"],
+            output,
+            job.get("usage") or output.get("usage") or {},
+            adopted_call_id=adopted_call_id,
+        )
     except GenerationCancelled:
+        finalize_generation_job_adoption(job["id"])
         with transaction() as conn:
             conn.execute(
                 "UPDATE generation_jobs SET status='canceled', stage='completed', stage_label='已取消', progress=100, message='已取消，未保存本次生成结果', completed_at=?, updated_at=? WHERE id=?",

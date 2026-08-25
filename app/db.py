@@ -320,6 +320,23 @@ def _migrate_story_planning_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (session_id) REFERENCES planning_sessions(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_planning_artifacts_session ON planning_artifacts(session_id, step, status);
+        CREATE TABLE IF NOT EXISTS planning_artifact_snapshots (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            artifact_id TEXT NOT NULL,
+            step TEXT NOT NULL,
+            item_key TEXT NOT NULL,
+            content_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'draft',
+            version INTEGER NOT NULL DEFAULT 1,
+            source TEXT NOT NULL DEFAULT 'model',
+            feedback TEXT NOT NULL DEFAULT '',
+            checks_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES planning_sessions(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_planning_snapshots_artifact
+            ON planning_artifact_snapshots(session_id, step, item_key, created_at DESC);
         """
     )
 
@@ -695,6 +712,28 @@ def _migrate_model_call_log_history(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_model_call_log_schema(conn: sqlite3.Connection) -> None:
+    """Add call-level lifecycle fields without rewriting historical records."""
+    for column, definition in {
+        "parse_status": "TEXT NOT NULL DEFAULT 'not_recorded'",
+        "quality_status": "TEXT NOT NULL DEFAULT 'not_recorded'",
+        "adoption_status": "TEXT NOT NULL DEFAULT 'not_recorded'",
+        "repair_of_call_id": "TEXT",
+    }.items():
+        _ensure_column(conn, "model_call_logs", column, definition)
+    # Repair metadata was already stored in the request envelope by earlier
+    # versions. Promote it when the new explicit column is introduced.
+    conn.execute(
+        """
+        UPDATE model_call_logs
+        SET repair_of_call_id=json_extract(request_json, '$.observability.repair_of_call_id')
+        WHERE (repair_of_call_id IS NULL OR repair_of_call_id='')
+          AND json_valid(request_json)
+          AND json_extract(request_json, '$.observability.repair_of_call_id') IS NOT NULL
+        """
+    )
+
+
 def _migrate_long_form_structure_schema(conn: sqlite3.Connection) -> None:
     """Add separate long-form pacing coordinates without overloading story time."""
     _ensure_column(conn, "works", "target_chapter_count", "INTEGER NOT NULL DEFAULT 0")
@@ -1050,6 +1089,10 @@ def init_db() -> None:
                 model TEXT NOT NULL DEFAULT '',
                 base_url TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'running',
+                parse_status TEXT NOT NULL DEFAULT 'not_recorded',
+                quality_status TEXT NOT NULL DEFAULT 'not_recorded',
+                adoption_status TEXT NOT NULL DEFAULT 'not_recorded',
+                repair_of_call_id TEXT,
                 request_json TEXT NOT NULL DEFAULT '{}',
                 response_text TEXT NOT NULL DEFAULT '',
                 response_json TEXT NOT NULL DEFAULT '',
@@ -1141,6 +1184,7 @@ def init_db() -> None:
         _migrate_state_engine_schema(conn)
         _migrate_long_form_structure_schema(conn)
         _migrate_inspiration_schema(conn)
+        _migrate_model_call_log_schema(conn)
         _migrate_model_call_log_history(conn)
         row = conn.execute("SELECT id FROM users WHERE username = ?", ("demo",)).fetchone()
         if not row:

@@ -9,7 +9,9 @@ from uuid import uuid4
 from app.db import transaction
 from app.services.novel_engine import engine
 from app.services.narrative_structure import DEFAULT_DETAIL_WINDOW, narrative_location, narrative_window, suggested_target_chapters
+from app.services.planning_quality import evaluate_outline
 from app.services.state_engine import get_story_state
+from app.services.story_state import validate_chapter_plan
 from app.utils import json_dumps, now_iso
 
 
@@ -145,6 +147,39 @@ def _decorate(item: dict[str, Any], chapter_no: int, work: dict[str, Any], fact_
     return result
 
 
+def _chapter_issues(
+    work: dict[str, Any],
+    item: dict[str, Any],
+    *,
+    raw_phase_missing: bool = False,
+) -> list[str]:
+    """Validate one chapter before any batch-level aggregation occurs."""
+    chapter_no = int(item.get("chapter_no") or 0)
+    issues, _score = evaluate_outline(work, [item], 1, expected_from_chapter=chapter_no)
+    if raw_phase_missing:
+        issues.append(f"第{chapter_no}章缺少模型返回的故事阶段标识。")
+    known_mainlines = {
+        str(candidate.get("title") or "").strip()
+        for candidate in [*(work.get("plot_arcs") or []), *(work.get("story_volumes") or [])]
+        if str(candidate.get("title") or "").strip()
+    }
+    plot_arc = str(item.get("plot_arc") or "").strip()
+    if known_mainlines and plot_arc and plot_arc not in known_mainlines:
+        issues.append(f"第{chapter_no}章所属主线“{plot_arc}”不存在于已确认卷级主线。")
+    issues.extend(validate_chapter_plan(work, item, replacing_no=chapter_no))
+    return list(dict.fromkeys(issues))
+
+
+def _batch_structure_issues(items: list[dict[str, Any]], expected_numbers: list[int]) -> list[str]:
+    numbers = [int(item.get("chapter_no") or 0) for item in items]
+    issues: list[str] = []
+    if len(items) != len(expected_numbers):
+        issues.append(f"要求 {len(expected_numbers)} 章，实际返回 {len(items)} 章。")
+    if numbers != expected_numbers:
+        issues.append("整批章节编号不连续或顺序错误。")
+    return issues
+
+
 def generate_outline_batches(
     work: dict[str, Any], request: dict[str, Any], profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -158,6 +193,7 @@ def generate_outline_batches(
     current_work = deepcopy(work)
     current_work["outline_state_context"] = state
     current_work["future_planning_context"] = current_work.get("future_plans") or []
+    repair_history: list[dict[str, Any]] = []
     for batch_start in range(from_chapter, to_chapter + 1, BATCH_SIZE):
         batch_end = min(batch_start + BATCH_SIZE - 1, to_chapter)
         generation_context = {
@@ -169,13 +205,90 @@ def generate_outline_batches(
         raw = engine.generate_outline(current_work, batch_end - batch_start + 1, profile, generation_context=generation_context)
         source = "model" if raw.get("generation_source") == "model" else source
         quality_issues.extend(raw.get("quality_issues") or [])
+        expected_numbers = list(range(batch_start, batch_end + 1))
         items = raw.get("chapters") or []
-        if len(items) != batch_end - batch_start + 1:
-            raise ValueError("分批大纲生成返回的章节数与请求范围不一致")
+        structure_issues = _batch_structure_issues(items, expected_numbers)
+        if structure_issues:
+            original_items = deepcopy(items)
+            repair_data = engine.repair_outline_chapters(
+                current_work,
+                [{"chapter_no": chapter_no, "chapter": next((item for item in items if int(item.get("chapter_no") or 0) == chapter_no), {})} for chapter_no in expected_numbers],
+                {"batch": structure_issues},
+                profile,
+                generation_context={**generation_context, "target_chapter_numbers": expected_numbers},
+            )
+            repaired_items = repair_data.get("chapters") if isinstance(repair_data, dict) else []
+            repair_history.append({
+                "scope": "batch",
+                "chapter_numbers": expected_numbers,
+                "original_output": original_items,
+                "issues": {"batch": structure_issues},
+                "repair_result": deepcopy(repair_data),
+            })
+            if isinstance(repaired_items, list):
+                items = repaired_items
+            structure_issues = _batch_structure_issues(items, expected_numbers)
+            if structure_issues:
+                raise ValueError("分批大纲结构修复后仍不完整：" + "；".join(structure_issues))
         batch: list[dict[str, Any]] = []
+        original_raw_by_number = {
+            int(item.get("chapter_no")): deepcopy(item)
+            for item in items
+            if isinstance(item, dict) and str(item.get("chapter_no") or "").lstrip("-").isdigit()
+        }
+        chapter_issues: dict[int, list[str]] = {}
         for index, item in enumerate(items):
             item_work = {**current_work, "chapter_plans": [*(current_work.get("chapter_plans") or []), *batch]}
-            batch.append(_decorate(item, batch_start + index, item_work, fact_version))
+            chapter_no = batch_start + index
+            raw_phase_missing = not str(item.get("phase_key") or "").strip()
+            decorated = _decorate(item, chapter_no, item_work, fact_version)
+            issues = _chapter_issues(item_work, decorated, raw_phase_missing=raw_phase_missing)
+            if issues:
+                chapter_issues[chapter_no] = issues
+            batch.append(decorated)
+        if chapter_issues:
+            failed_numbers = sorted(chapter_issues)
+            original_items = [
+                deepcopy(original_raw_by_number.get(chapter_no, next(item for item in batch if item.get("chapter_no") == chapter_no)))
+                for chapter_no in failed_numbers
+            ]
+            repair_data = engine.repair_outline_chapters(
+                current_work,
+                [{"chapter_no": chapter_no, "chapter": next(item for item in batch if item.get("chapter_no") == chapter_no)} for chapter_no in failed_numbers],
+                {str(chapter_no): issues for chapter_no, issues in chapter_issues.items()},
+                profile,
+                generation_context={**generation_context, "target_chapter_numbers": failed_numbers},
+            )
+            repaired_items = repair_data.get("chapters") if isinstance(repair_data, dict) else []
+            repaired_by_number = {
+                int(item.get("chapter_no")): item
+                for item in repaired_items or []
+                if isinstance(item, dict) and str(item.get("chapter_no") or "").lstrip("-").isdigit()
+            }
+            for index, item in enumerate(batch):
+                chapter_no = int(item.get("chapter_no") or 0)
+                if chapter_no in repaired_by_number:
+                    batch[index] = _decorate(repaired_by_number[chapter_no], chapter_no, current_work, fact_version)
+            repair_history.append({
+                "scope": "chapters",
+                "chapter_numbers": failed_numbers,
+                "original_output": original_items,
+                "issues": {str(chapter_no): issues for chapter_no, issues in chapter_issues.items()},
+                "repair_result": deepcopy(repair_data),
+            })
+            remaining_issues: dict[int, list[str]] = {}
+            recheck_work = {**current_work, "chapter_plans": [*(current_work.get("chapter_plans") or []), *batch]}
+            for item in batch:
+                chapter_no = int(item.get("chapter_no") or 0)
+                issues = _chapter_issues(recheck_work, item)
+                if issues:
+                    remaining_issues[chapter_no] = issues
+            if remaining_issues:
+                raise ValueError(
+                    "章节定向修复后仍有问题："
+                    + "；".join(f"第{chapter_no}章：{'、'.join(issues)}" for chapter_no, issues in remaining_issues.items())
+                )
+            quality_issues.extend(issue for issues in chapter_issues.values() for issue in issues)
         generated.extend(batch)
         current_work["chapter_plans"] = [
             *(current_work.get("chapter_plans") or []), *batch,
@@ -190,6 +303,8 @@ def generate_outline_batches(
         "fact_version": fact_version,
         "generation_source": source,
         "quality_issues": list(dict.fromkeys(quality_issues)),
+        "repair_history": repair_history,
+        "repair_count": len(repair_history),
         "batch_size": BATCH_SIZE,
         "batches": [
             {"from_chapter": start, "to_chapter": min(start + BATCH_SIZE - 1, to_chapter)}

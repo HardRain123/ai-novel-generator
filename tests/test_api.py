@@ -1,4 +1,5 @@
 import json
+import json
 import os
 import sqlite3
 import tempfile
@@ -18,13 +19,16 @@ os.environ.pop("LLM_API_KEY", None)
 from app.main import app  # noqa: E402
 from app.services.context_builder import build_context, chapter_generation_context  # noqa: E402
 from app.services.character_cards import compact_character, planning_character  # noqa: E402
+from app.services import generation_jobs  # noqa: E402
 from app.services.generation_jobs import run_worker_once  # noqa: E402
 from app.services import model_profiles, novel_engine  # noqa: E402
+from app.services import model_call_logs  # noqa: E402
 from app.services.model_profiles import profile_for_task  # noqa: E402
 from app.services.novel_engine import NovelEngine, _parse_json, codex_process_env, configured_prompt, engine  # noqa: E402
-from app.services.planning_quality import evaluate_outline, language_risks, planning_checks  # noqa: E402
+from app.services.planning_quality import evaluate_outline, language_risks, planning_checks, planning_consistency_checks, planning_coverage_checks, planning_field_rules  # noqa: E402
 from app.services import trends  # noqa: E402
 from app.services.generation_jobs import _planning_context  # noqa: E402
+from app.services.planning_repository import _required_character_keys, confirmed_context, confirm_artifact, planning_context_for_step, upsert_artifact  # noqa: E402
 from app.services.repository import get_work  # noqa: E402
 from app.db import transaction  # noqa: E402
 from app.utils import now_iso  # noqa: E402
@@ -40,6 +44,109 @@ def test_health(client):
     response = client.get("/api/health")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+def test_r1c_planning_rules_are_exposed_from_the_backend_source(client):
+    response = client.get("/api/planning-rules")
+    assert response.status_code == 200
+    rules = response.json()
+    assert rules["version"] == planning_field_rules()["version"]
+    assert rules["default_rule"] == {"type": "text", "required": True, "hard": True, "min": 20, "max": 100}
+    assert rules["steps"]["protagonist"]["biography"] == {"type": "text", "required": True, "hard": True, "min": 120, "max": 260}
+    assert rules["steps"]["arc"]["synopsis"]["min"] == 120
+    assert rules["steps"]["arc"]["synopsis"]["max"] == 300
+    assert rules["steps"]["summary"]["summary"]["min"] == 180
+    assert rules["steps"]["summary"]["summary"]["max"] == 350
+    assert rules["steps"]["arc"]["title"]["min"] == 1
+    assert rules["steps"]["arc"]["title"]["max"] == 40
+    assert rules["steps"]["summary"]["ending"]["hard"] is False
+
+
+def test_r1c_planning_hard_limits_accept_boundaries_and_block_outside_values():
+    def has_issue(result, label):
+        return any(label in issue for issue in result["blocking"])
+
+    for length in (120, 260):
+        assert not has_issue(planning_checks("protagonist", {"character": {"biography": "字" * length}}), "人物小传")
+    for length in (119, 261):
+        assert has_issue(planning_checks("protagonist", {"character": {"biography": "字" * length}}), "人物小传")
+
+    for length in (180, 350):
+        assert not has_issue(planning_checks("summary", {"story_bible": {"summary": "字" * length}}), "总梗概")
+    for length in (179, 351):
+        assert has_issue(planning_checks("summary", {"story_bible": {"summary": "字" * length}}), "总梗概")
+
+    valid_setting = {field: "字" * 20 for field in ("core_hook", "core_conflict", "world", "stakes", "ending")}
+    assert not has_issue(planning_checks("setting", {"story_bible": valid_setting}), "核心钩子")
+    valid_setting["core_hook"] = "字" * 19
+    assert has_issue(planning_checks("setting", {"story_bible": valid_setting}), "核心钩子")
+
+    valid_arc = {
+        "title": "一", "goal": "字" * 20, "opposition": "字" * 20,
+        "turning_point": "字" * 20, "ending_state": "字" * 20, "synopsis": "字" * 120,
+    }
+    assert not has_issue(planning_checks("arc", {"arc": valid_arc}), "卷梗概")
+    valid_arc["synopsis"] = "字" * 119
+    assert has_issue(planning_checks("arc", {"arc": valid_arc}), "卷梗概")
+    valid_arc["synopsis"] = "字" * 120
+    valid_arc["title"] = ""
+    assert has_issue(planning_checks("arc", {"arc": valid_arc}), "卷标题")
+    valid_arc["title"] = "字" * 40
+    assert not has_issue(planning_checks("arc", {"arc": valid_arc}), "卷标题")
+    valid_arc["title"] = "字" * 41
+    assert has_issue(planning_checks("arc", {"arc": valid_arc}), "卷标题")
+
+
+def test_r1c_frontend_reads_field_ranges_and_marks_hard_limits_from_api():
+    source = (Path(__file__).resolve().parents[1] / "web" / "app" / "page.tsx").read_text(encoding="utf-8")
+    assert 'api<PlanningRules>("/planning-rules")' in source
+    assert "planningFieldSpecs(step, content, rules)" in source
+    assert 'field.hard ? "硬限制" : "建议"' in source
+    assert 'const contractFields: Array<[string, string, boolean?]>' in source
+    assert "120, 260" not in source
+    assert "180, 350" not in source
+
+
+def test_planning_snapshots_can_restore_an_earlier_draft(client):
+    created = client.post("/api/works", json={"title": "规划快照测试"})
+    work_id = created.json()["id"]
+    first = {"story_bible": {"summary": "第一版全书总梗概，从起点推进到结局。"}}
+    second = {"story_bible": {"summary": "第二版全书总梗概，加入中点和最低谷。"}}
+
+    assert client.put(f"/api/works/{work_id}/planning-steps/summary/default", json={"content": first}).status_code == 200
+    assert client.put(f"/api/works/{work_id}/planning-steps/summary/default", json={"content": second}).status_code == 200
+    snapshots = client.get(f"/api/works/{work_id}/planning-snapshots?step=summary&item_key=default")
+    assert snapshots.status_code == 200
+    items = snapshots.json()["items"]
+    assert [item["version"] for item in items[:2]] == [2, 1]
+    old_snapshot = next(item for item in items if item["version"] == 1)
+
+    restored = client.post(f"/api/works/{work_id}/planning-snapshots/{old_snapshot['id']}/restore")
+    assert restored.status_code == 200
+    artifact = next(item for item in restored.json()["artifacts"] if item["step"] == "summary")
+    assert artifact["content"] == first
+    assert artifact["version"] == 3
+
+
+def test_planning_session_exposes_full_book_coverage_for_the_wizard(client):
+    created = client.post("/api/works", json={"title": "规划覆盖展示", "estimated_words": 100000, "target_chapter_count": 40})
+    work_id = created.json()["id"]
+    upsert_artifact(work_id, "arc", "arc:1", {"arc": {
+        "title": "第一卷至终局",
+        "start_chapter": 1,
+        "end_chapter": 40,
+        "synopsis": "从起点推进，经由中点和最低谷，进入最终清算与结局。",
+    }})
+    upsert_artifact(work_id, "summary", "default", {"story_bible": {
+        "summary": "全书总梗概覆盖从起点、升级、中点、最低谷到最终清算和结局。",
+    }})
+
+    response = client.get(f"/api/works/{work_id}/planning-session")
+    assert response.status_code == 200
+    coverage = response.json()["coverage_checks"]["coverage"]
+    assert coverage["planned_chapters"] == 40
+    assert coverage["coverage_ratio"] == 1.0
+    assert coverage["summary_scope"] == "full_book"
 
 
 def test_model_json_parser_keeps_first_complete_value_when_provider_appends_data():
@@ -648,6 +755,340 @@ def test_persistent_generation_job_is_idempotent_and_runnable(client):
     assert retried.json()["status"] == "queued"
 
 
+def test_p0e_demo_fallback_is_explicitly_marked(client):
+    data = NovelEngine().generate_setup({"title": "演示模式状态"})
+
+    assert data["generation_source"] == "fallback"
+    assert data["repair_attempts"] == 0
+    assert data["parse_status"] == "not_attempted"
+    assert data["quality_status"] in {"passed", "failed"}
+
+
+def test_p0e_configured_model_failure_fails_job_without_saving_fallback(client, monkeypatch):
+    calls = []
+
+    def invalid_model_response(*_args, **_kwargs):
+        calls.append(True)
+        return None
+
+    monkeypatch.setattr(NovelEngine, "_llm_json", invalid_model_response)
+    profile = client.post("/api/model-profiles", json={
+        "name": f"P0-E 失败模型-{uuid4().hex}",
+        "base_url": "https://example.com/v1",
+        "model": "invalid-json-model",
+        "api_key": "sk-p0e-test-123456",
+    })
+    assert profile.status_code == 200
+    work = client.post("/api/works", json={
+        "title": "真实模型失败不落 fallback",
+        "model_profile_id": profile.json()["id"],
+    })
+    assert work.status_code == 200
+    work_id = work.json()["id"]
+
+    queued = client.post(f"/api/works/{work_id}/generation-jobs", json={"kind": "setup"})
+    assert queued.status_code == 202
+    assert run_worker_once() is True
+
+    failed = client.get(f"/api/works/{work_id}/generation-jobs/{queued.json()['id']}").json()
+    assert failed["status"] == "failed"
+    assert "定向结构修复" in failed["error"]
+    assert len(calls) == 2
+    saved = client.get(f"/api/works/{work_id}").json()
+    assert saved["story_bible"]["summary"] == ""
+    assert saved["story_bible"]["generation_source"] == ""
+    assert not saved.get("characters")
+    assert client.patch(f"/api/model-profiles/{profile.json()['id']}", json={"enabled": False}).status_code == 200
+
+
+def test_p0e_repair_calls_are_linked_in_model_call_observability(monkeypatch):
+    requests = []
+    finished = []
+
+    class Response:
+        usage_metadata = {}
+        response_metadata = {}
+
+        def __init__(self, content):
+            self.content = content
+
+    class FakeClient:
+        def __init__(self):
+            self.responses = [Response("not json"), Response('{"candidates": []}')]
+
+        def invoke(self, _messages):
+            return self.responses.pop(0)
+
+    fake_client = FakeClient()
+
+    def record_call(_profile, request):
+        requests.append(request)
+        return f"p0e-call-{len(requests)}"
+
+    def finish_call(call_id, **kwargs):
+        finished.append((call_id, kwargs.get("status")))
+
+    monkeypatch.setattr(novel_engine, "start_model_call", record_call)
+    monkeypatch.setattr(novel_engine, "finish_model_call", finish_call)
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", lambda **_kwargs: fake_client)
+
+    data, _usage, source = NovelEngine().generate_planning_step(
+        {"title": "修复调用关联"},
+        "contract",
+        "contract",
+        {},
+        profile={
+            "id": "p0e-profile",
+            "provider": "openai_compatible",
+            "base_url": "https://example.com/v1",
+            "model": "fake-model",
+            "api_key": "sk-p0e-test-123456",
+        },
+    )
+
+    assert data == {"candidates": []}
+    assert source == "model"
+    assert len(requests) == 2
+    assert requests[1]["observability"]["repair_of_call_id"] == "p0e-call-1"
+    assert requests[1]["observability"]["repair_attempt"] == 1
+    assert finished == [("p0e-call-1", "success"), ("p0e-call-2", "success")]
+
+
+def _character_batch_context():
+    return {
+        "cast_roster": [{
+            "characters": [
+                {"item_key": "character:1", "name": "顾遥", "role": "盟友", "story_function": "提供关键行动能力"},
+                {"item_key": "character:2", "name": "陆衡", "role": "对手", "story_function": "制造持续压力"},
+            ],
+        }],
+    }
+
+
+def _character_batch_response(item_keys):
+    return {
+        "characters": [
+            {"item_key": item_key, "character": {"name": f"模型人物-{item_key}"}}
+            for item_key in item_keys
+        ],
+    }
+
+
+def _configured_batch_profile():
+    return {
+        "id": "p0a-batch-profile",
+        "provider": "openai_compatible",
+        "base_url": "https://example.com/v1",
+        "model": "batch-model",
+        "api_key": "sk-p0a-batch-test",
+    }
+
+
+def test_p0a_character_batch_repairs_partial_response_without_fallback(monkeypatch):
+    monkeypatch.setattr(novel_engine, "configured_prompt", lambda *_args: "planning")
+    responses = [
+        _character_batch_response(["character:1"]),
+        _character_batch_response(["character:1", "character:2"]),
+    ]
+    calls = []
+
+    def fake_batch_call(_system, user, *_args, **_kwargs):
+        calls.append(user)
+        return responses.pop(0), {}
+
+    monkeypatch.setattr(NovelEngine, "_llm_json_with_usage", fake_batch_call)
+    result, _usage, source = NovelEngine().generate_character_batch(
+        {"title": "批量人物修复"},
+        ["character:1", "character:2"],
+        _character_batch_context(),
+        profile=_configured_batch_profile(),
+    )
+
+    assert len(calls) == 2
+    assert set(result) == {"character:1", "character:2"}
+    assert {item["name"] for item in result.values()} == {"顾遥", "陆衡"}
+    assert source == "model"
+
+
+@pytest.mark.parametrize(
+    "invalid_result",
+    [
+        {"characters": [
+            {"item_key": "character:1", "character": {"name": "重复一"}},
+            {"item_key": "character:1", "character": {"name": "重复二"}},
+        ]},
+        {"characters": [
+            {"item_key": "character:1", "character": {"name": "顾遥"}},
+            {"item_key": "character:unknown", "character": {"name": "未知"}},
+        ]},
+        {"characters": [
+            {"item_key": "character:1", "character": "不是对象"},
+            {"item_key": "character:2", "character": {"name": "陆衡"}},
+        ]},
+    ],
+)
+def test_p0a_character_batch_repairs_invalid_item_keys_or_character_shape(monkeypatch, invalid_result):
+    monkeypatch.setattr(novel_engine, "configured_prompt", lambda *_args: "planning")
+    responses = [invalid_result, _character_batch_response(["character:1", "character:2"])]
+    call_count = 0
+
+    def fake_batch_call(*_args, **_kwargs):
+        nonlocal call_count
+        call_count += 1
+        return responses.pop(0), {}
+
+    monkeypatch.setattr(NovelEngine, "_llm_json_with_usage", fake_batch_call)
+    result, _usage, source = NovelEngine().generate_character_batch(
+        {"title": "批量人物键校验"},
+        ["character:1", "character:2"],
+        _character_batch_context(),
+        profile=_configured_batch_profile(),
+    )
+
+    assert call_count == 2
+    assert set(result) == {"character:1", "character:2"}
+    assert source == "model"
+
+
+def test_p0a_character_batch_repair_failure_raises_without_fallback(monkeypatch):
+    monkeypatch.setattr(novel_engine, "configured_prompt", lambda *_args: "planning")
+    calls = []
+
+    def fake_batch_call(*_args, **_kwargs):
+        calls.append(True)
+        return _character_batch_response(["character:1"]), {}
+
+    engine_instance = NovelEngine()
+    fallback_calls = []
+    monkeypatch.setattr(NovelEngine, "_llm_json_with_usage", fake_batch_call)
+    monkeypatch.setattr(
+        engine_instance,
+        "_planning_fallback",
+        lambda *_args, **_kwargs: fallback_calls.append(True),
+    )
+
+    with pytest.raises(ValueError, match="定向结构修复"):
+        engine_instance.generate_character_batch(
+            {"title": "批量人物修复失败"},
+            ["character:1", "character:2"],
+            _character_batch_context(),
+            profile=_configured_batch_profile(),
+        )
+
+    assert len(calls) == 2
+    assert fallback_calls == []
+
+
+def test_p0a_configured_batch_failure_does_not_save_partial_drafts(client, monkeypatch):
+    monkeypatch.setattr(novel_engine, "configured_prompt", lambda *_args: "planning")
+    profile = client.post("/api/model-profiles", json={
+        "name": f"P0-A 批量失败-{uuid4().hex}",
+        "base_url": "https://example.com/v1",
+        "model": "batch-invalid-model",
+        "api_key": "sk-p0a-batch-test-123456",
+    })
+    assert profile.status_code == 200
+    work = client.post("/api/works", json={"title": "批量失败不落库"})
+    work_id = work.json()["id"]
+    monkeypatch.setattr(generation_jobs, "_planning_context", lambda *_args, **_kwargs: _character_batch_context())
+
+    def invalid_batch_call(*_args, **_kwargs):
+        return _character_batch_response(["character:1"]), {}
+
+    monkeypatch.setattr(NovelEngine, "_llm_json_with_usage", invalid_batch_call)
+    queued = client.post(
+        f"/api/works/{work_id}/generation-jobs",
+        json={
+            "kind": "planning_character_batch",
+            "payload": {"item_keys": ["character:1", "character:2"]},
+            "model_profile_id": profile.json()["id"],
+        },
+    )
+    assert queued.status_code == 202, queued.text
+    assert run_worker_once() is True
+
+    failed = client.get(f"/api/works/{work_id}/generation-jobs/{queued.json()['id']}").json()
+    assert failed["status"] == "failed"
+    assert "定向结构修复" in failed["error"]
+    session = client.get(f"/api/works/{work_id}/planning-session").json()
+    assert not [item for item in session["artifacts"] if item["step"] == "character"]
+    assert client.patch(f"/api/model-profiles/{profile.json()['id']}", json={"enabled": False}).status_code == 200
+
+
+def test_character_batch_quality_is_written_to_the_final_model_call(client, monkeypatch):
+    profile = client.post("/api/model-profiles", json={
+        "name": f"R1-A 批量质检-{uuid4().hex}",
+        "base_url": "https://example.com/v1",
+        "model": "r1a-batch-model",
+        "api_key": "sk-r1a-batch-test-123456",
+    })
+    assert profile.status_code == 200, profile.text
+    work = client.post("/api/works", json={"title": "批量人物调用状态"})
+    work_id = work.json()["id"]
+    monkeypatch.setattr(generation_jobs, "_planning_context", lambda *_args, **_kwargs: _character_batch_context())
+    monkeypatch.setattr(
+        generation_jobs,
+        "character_batch_checks",
+        lambda drafts, _context: {
+            item_key: {"blocking": [], "warnings": [], "ok": True}
+            for item_key in drafts
+        },
+    )
+
+    def successful_batch_call(self, _system, user, profile, *_args, **_kwargs):
+        item_keys = [item["item_key"] for item in json.loads(user)["selected_roster_characters"]]
+        response = _character_batch_response(item_keys)
+        call_id = model_call_logs.start_model_call(
+            profile,
+            {"transport": "openai", "model": profile.get("model"), "stream": False},
+        )
+        self._last_model_call_id = call_id
+        model_call_logs.finish_model_call(
+            call_id,
+            status="success",
+            response_text=json.dumps(response, ensure_ascii=False),
+            response=response,
+            parse_status="success",
+        )
+        return response, {}
+
+    monkeypatch.setattr(NovelEngine, "_llm_json_with_usage", successful_batch_call)
+    queued = client.post(
+        f"/api/works/{work_id}/generation-jobs",
+        json={
+            "kind": "planning_character_batch",
+            "payload": {"item_keys": ["character:1", "character:2"]},
+            "model_profile_id": profile.json()["id"],
+        },
+    )
+    assert queued.status_code == 202, queued.text
+    assert run_worker_once() is True
+    job_id = queued.json()["id"]
+    job = client.get(f"/api/works/{work_id}/generation-jobs/{job_id}").json()
+    assert job["status"] == "completed", job
+    calls = client.get(f"/api/model-call-logs?work_id={work_id}&limit=10").json()["items"]
+    item = next(call for call in calls if call["generation_job_id"] == job_id)
+    assert item["parse_status"] == "success"
+    assert item["quality_status"] == "passed"
+    assert item["adoption_status"] == "adopted"
+    assert client.patch(f"/api/model-profiles/{profile.json()['id']}", json={"enabled": False}).status_code == 200
+
+
+def test_p0a_character_batch_demo_fallback_remains_complete(monkeypatch):
+    monkeypatch.setattr(novel_engine, "configured_prompt", lambda *_args: "planning")
+    monkeypatch.setattr(NovelEngine, "_llm_json_with_usage", lambda *_args, **_kwargs: (None, {}))
+
+    result, _usage, source = NovelEngine().generate_character_batch(
+        {"title": "演示批量人物"},
+        ["character:1", "character:2"],
+        _character_batch_context(),
+        profile=None,
+    )
+
+    assert set(result) == {"character:1", "character:2"}
+    assert source == "fallback"
+
+
 def test_volume_outline_job_keeps_dynamic_coordinates_and_returns_unsaved_draft(client, monkeypatch):
     created = client.post(
         "/api/works",
@@ -811,6 +1252,7 @@ def test_codex_connection_test_has_a_short_timeout(client, monkeypatch):
 
     assert response.status_code == 200, response.text
     assert seen["timeout_seconds"] == model_profiles.CODEX_CONNECTION_TEST_TIMEOUT_SECONDS
+    assert client.patch(f"/api/model-profiles/{profile.json()['id']}", json={"enabled": False}).status_code == 200
 
 
 def test_codex_exec_explicitly_reads_prompt_from_stdin(monkeypatch):
@@ -886,6 +1328,530 @@ def test_generation_job_exposes_and_freezes_actual_model(client):
     assert client.patch(f"/api/model-profiles/{profile.json()['id']}", json={"enabled": False}).status_code == 200
 
 
+def test_planning_summary_promotes_single_candidate_wrapper(client, monkeypatch):
+    generated = {
+        "candidate_count": 1,
+        "candidates": [{
+            "story_bible": {
+                "summary": "一段足够完整的故事梗概。" * 20,
+                "theme": "人在压力下仍要为自己的规则负责。",
+                "style_rules": "短句推进，行动体现选择。",
+            }
+        }],
+    }
+    monkeypatch.setattr(
+        NovelEngine,
+        "_llm_json_with_usage",
+        lambda *_args, **_kwargs: (generated, {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}),
+    )
+
+    data, usage, source = NovelEngine().generate_planning_step(
+        {"title": "候选包装测试"}, "summary", "default", {},
+    )
+
+    assert data == generated["candidates"][0]
+    assert data["story_bible"]["summary"]
+    assert usage["total_tokens"] == 3
+    assert source == "model"
+
+
+def test_planning_context_for_step_selects_contract_and_compacts_summary(client):
+    created = client.post("/api/works", json={"title": "上下文净化测试"})
+    work_id = created.json()["id"]
+
+    def save_and_confirm(step, item_key, content):
+        upsert_artifact(work_id, step, item_key, content)
+        confirm_artifact(work_id, step, item_key)
+
+    contract_a = {"title": "契约 A", "body": "A 正文" * 220, "style_rules": "具体行动推动情节并保持明确回报节奏和人物选择"}
+    contract_b = {
+        "title": "契约 B",
+        "body": "B 正文" * 220,
+        "style_rules": "具体行动推动情节并保持明确回报节奏和人物选择",
+        "must_have_elements": ["B 的核心回报"],
+    }
+    contract_c = {"title": "契约 C", "body": "C 正文" * 220, "style_rules": "具体行动推动情节并保持明确回报节奏和人物选择"}
+    save_and_confirm("contract", "contract", {"candidates": [contract_a, contract_b, contract_c], "selected": contract_b})
+    save_and_confirm("setting", "default", {"story_bible": {
+        "core_hook": "核心设定起点：旧城封锁迫使主角主动介入。",
+        "core_conflict": "主角要公开证据，对手要保住既有秩序，双方不能同时达成目标。",
+        "world": "证据只能通过有限的记忆设备读取，每次读取都会消耗一次机会。",
+        "stakes": "失败会失去证据和同伴，成功也会暴露主角过去的责任。",
+        "ending": "主角在最终冲突中公开证据并承担关系破裂的代价。",
+        "irrelevant": "不应进入摘要上下文",
+    }})
+    save_and_confirm("protagonist", "default", {"character": {
+        "name": "沈峙", "role": "主角", "goal": "在封锁结束前公开证据并保护仍愿意作证的人",
+        "conflict": "对手持续销毁证据并利用旧案责任逼迫他保持沉默",
+        "motivation": "弥补当年因沉默造成的伤害并承担公开真相的代价",
+        "flaw": "习惯独自确认全部信息后才行动，常常错过保护同伴的时机",
+        "character_arc": "从谨慎旁观转向承担公开真相和关系破裂的代价",
+        "appearance": "身形清瘦但肩背挺直，眉眼有一道旧伤，常穿磨白的深色工装外套，左手指节留着烧伤痕迹。",
+        "personality": "他习惯先记录证据再做判断，遇到威胁时仍会把同伴安全放在选择前面。",
+        "voice": "他说话短而具体，先说明行动和代价，再要求对方回答能否承担后果。",
+        "biography": "沈峙曾因一次沉默让关键证人失去保护，此后他把所有选择都拆成可核验的证据链。封锁旧城后，他发现当年的责任并未结束，反而被新的权力关系重新利用。为了阻止证据被销毁，他必须一边说服不再信任他的同伴，一边承认自己也曾从沉默中获利，最终选择公开真相并接受生活彻底改变。",
+        "facets": {},
+    }})
+    save_and_confirm("cast_roster", "default", {"characters": [
+        {"item_key": "character:1", "name": "顾遥", "role": "盟友", "story_function": "提供关键行动能力", "relationship_to_protagonist": "从互相利用到共同承担风险"},
+        {"item_key": "character:2", "name": "陆衡", "role": "对手", "story_function": "持续制造外部压力", "relationship_to_protagonist": "试图让主角放弃公开证据"},
+    ]})
+    save_and_confirm("character", "character:1", {"character": {
+        "name": "顾遥", "role": "盟友", "story_function": "提供关键行动能力", "biography": "顾遥曾因一次错误判断失去家人，因此决定把证据送到真正能使用它的人手中。她多年在封锁区边缘替人运送物资，熟悉每条检查线的漏洞，也清楚任何一次冒险都会把无辜者拖进旧案。她最初只相信自己准备的退路，直到主角愿意公开承认责任，她才决定把证据和自己的名字一起交出去。",
+            "dramatic_core": {"goal": "在证据被销毁前把它送到公开审查的渠道并保护证人", "motivation": "弥补过去失误造成的伤害并让家人得到迟来的解释", "flaw": "过度依赖自己的退路，常常在同伴需要信任时先替他们做决定", "conflict": "不信任主角的犹豫，却又必须借助他的公开身份突破封锁"},
+            "character_arc": "从只相信个人退路，转向愿意把选择和风险交给同伴共同承担",
+            "appearance": "身形利落，短发贴着额角，眉尾有细疤，穿旧防水外套和硬底靴，右手腕留着一圈灼痕作为辨识标记。",
+        "personality": "她先观察退路和代价，再决定是否把别人纳入自己的计划，真正承诺后又极少后退。",
+        "voice": "她说话直接，习惯先报地点、时间和风险，拒绝用含糊的安慰替代行动安排。",
+        "facets": {},
+        "relationships": "她与主角先互相利用，后来因为共同承担公开证据的风险而建立了可验证的信任。",
+    }})
+    save_and_confirm("arc", "arc:1", {"arc": {
+        "title": "第一卷", "sequence": 1, "goal": "找到并保护原始证据，同时确认谁有能力公开它", "opposition": "对手利用封锁和舆论控制证人，让每条安全路线都承担新的暴露风险", "turning_point": "主角发现自己也参与了旧案的沉默，并且当年的选择仍在伤害盟友",
+        "ending_state": "证据暂时保住，但主角身份暴露，盟友要求他公开承担旧案责任", "synopsis": "主角从封锁起点出发，联合盟友突破检查线并追查原始证据的去向。中段他发现责任链也指向自己，原本的安全方案因此失效。卷末对手准备销毁证据时，主角选择公开自己的旧案责任，换取盟友继续把证据送入审查程序。这个决定同时改变了盟友对他的判断，也把下一卷的公开行动变成无法回避的现实。",
+        "payoffs": ["不应进入摘要上下文"],
+    }})
+    save_and_confirm("arc", "arc:2", {"arc": {
+        "title": "第二卷", "sequence": 2, "goal": "完成最终公开并让证人获得可持续的保护，同时建立新的审查渠道", "opposition": "对手用同伴安全和伪造证据逼迫主角撤回公开承诺", "turning_point": "对手用同伴安全逼迫主角撤回证据，主角却发现唯一的突破口要求他承认更大的责任",
+        "ending_state": "真相公开，主角失去原有身份，但证人和盟友获得了继续行动的空间", "synopsis": "主角在最低谷重新组织证据链，先承认公开行动带来的牺牲，再联合证人拆穿伪造材料。最终他以不可撤销的选择兑现创作契约，虽然失去原有身份，却让真相进入无法被单方撤回的审查流程，并让所有曾经依赖沉默获利的人面对新的责任和后果。证人因此获得持续保护，盟友也有机会在公开记录中恢复自己的选择权。",
+    }})
+
+    full_context = confirmed_context(work_id)
+    summary_context = planning_context_for_step(work_id, "summary")
+    full_chars = len(json.dumps(full_context, ensure_ascii=False))
+    summary_chars = len(json.dumps(summary_context, ensure_ascii=False))
+    assert summary_chars <= full_chars * 0.6
+
+    summary_text = json.dumps(summary_context, ensure_ascii=False)
+    assert "契约 B" in summary_text and "B 正文" in summary_text
+    assert "契约 A" not in summary_text and "契约 C" not in summary_text
+    assert "appearance" not in summary_text
+    assert "voice" not in summary_text
+    assert "facets" not in summary_text
+    assert "核心设定起点" in summary_text
+    assert "最终冲突中公开证据" in summary_text
+    assert "从互相利用到共同承担风险" in summary_text
+    assert "完成最终公开" in summary_text
+
+
+def test_model_call_records_planning_context_block_char_counts(monkeypatch):
+    captured = {}
+
+    class Response:
+        content = '{"ok": true}'
+        usage_metadata = {}
+        response_metadata = {}
+
+    class FakeClient:
+        def invoke(self, _messages):
+            return Response()
+
+    def record_call(_profile, request):
+        captured.update(request)
+        return "planning-call"
+
+    monkeypatch.setattr(novel_engine, "start_model_call", record_call)
+    monkeypatch.setattr(novel_engine, "finish_model_call", lambda *_args, **_kwargs: None)
+    fake_client = FakeClient()
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", lambda **_kwargs: fake_client)
+    metadata = {"context_char_counts": {"contract": 28, "setting": 41}, "context_chars_total": 69}
+
+    result, _usage = NovelEngine()._llm_json_with_usage(
+        "system", "user",
+        {"id": "planning-observability", "api_key": "test-key", "base_url": "https://example.com/v1", "model": "fake"},
+        0.1,
+        stream=False,
+        request_metadata=metadata,
+    )
+
+    assert result == {"ok": True}
+    assert captured["observability"] == metadata
+
+
+def test_model_call_page_projection_includes_task_context_and_repair_chain(client):
+    created = client.post("/api/works", json={"title": "调用观测测试"})
+    work_id = created.json()["id"]
+    queued = client.post(
+        f"/api/works/{work_id}/generation-jobs",
+        json={"kind": "planning_step", "payload": {"step": "summary", "item_key": "default"}},
+    )
+    job_id = queued.json()["id"]
+    profile = {"provider": "openai_compatible", "model": "actual-model", "base_url": "https://actual.example/v1"}
+    first = model_call_logs.start_model_call(
+        profile,
+        {"transport": "openai", "model": "actual-model", "temperature": 0.4, "reasoning_effort": "high", "timeout_seconds": 33, "observability": {"context_char_counts": {"contract": 40, "setting": 60}, "context_chars_total": 100}},
+        call_kind="planning_step", work_id=work_id, generation_job_id=job_id,
+    )
+    model_call_logs.finish_model_call(
+        first,
+        status="success",
+        response_text='{"ok": true}',
+        response={"ok": True},
+        parse_status="failed",
+        quality_status="not_checked",
+        adoption_status="not_adopted",
+    )
+    repair = model_call_logs.start_model_call(
+        profile,
+        {"transport": "openai", "model": "actual-model", "temperature": 0.2, "reasoning_effort": "high", "timeout_seconds": 33, "observability": {"repair_of_call_id": first}},
+        call_kind="planning_step", work_id=work_id, generation_job_id=job_id,
+    )
+    model_call_logs.finish_model_call(
+        repair,
+        status="success",
+        response_text='{"ok": true}',
+        response={"ok": True},
+        parse_status="success",
+        quality_status="passed",
+        adoption_status="adopted",
+    )
+    with transaction() as conn:
+        conn.execute(
+            "UPDATE generation_jobs SET status='completed', output_json=?, completed_at=?, updated_at=? WHERE id=?",
+            (json.dumps({"parse_status": "repaired", "quality_status": "passed"}, ensure_ascii=False), now_iso(), now_iso(), job_id),
+        )
+
+    listed = client.get(f"/api/model-call-logs?work_id={work_id}&limit=10")
+    assert listed.status_code == 200
+    first_item = next(entry for entry in listed.json()["items"] if entry["id"] == first)
+    item = next(entry for entry in listed.json()["items"] if entry["id"] == repair)
+    assert item["work_title"] == "调用观测测试"
+    assert item["task_name"] == "规划：summary"
+    assert item["planning_step"] == "summary"
+    assert item["item_key"] == "default"
+    assert item["generation_task_url"].endswith(f"/works/{work_id}/generation-jobs/{job_id}")
+    assert item["transmission_status"] == "delivered"
+    assert item["parse_status"] == "success"
+    assert item["quality_status"] == "passed"
+    assert item["adoption_status"] == "adopted"
+    assert item["effective_parameters"]["timeout_seconds"] == 33
+    assert first_item["parse_status"] == "failed"
+    assert first_item["adoption_status"] == "not_adopted"
+    assert first_item["failure_category"] == "structure_error"
+
+    detail = client.get(f"/api/model-call-logs/{repair}")
+    assert detail.status_code == 200
+    detail_data = detail.json()
+    assert [entry["id"] for entry in detail_data["call_chain"]] == [first, repair]
+    assert detail_data["context_char_shares"] == {}
+    expected_request_chars = len(json.dumps(
+        {"transport": "openai", "model": "actual-model", "temperature": 0.2, "reasoning_effort": "high", "timeout_seconds": 33, "observability": {"repair_of_call_id": first}},
+        ensure_ascii=False,
+    ))
+    expected_response_chars = len('{"ok": true}')
+    assert isinstance(item["request_chars"], int)
+    assert isinstance(item["response_chars"], int)
+    assert (item["request_chars"], item["response_chars"]) == (expected_request_chars, expected_response_chars)
+    assert (detail_data["request_chars"], detail_data["response_chars"]) == (expected_request_chars, expected_response_chars)
+    assert detail_data["response_text"] == '{"ok": true}'
+    assert all(isinstance(entry["request_chars"], int) and isinstance(entry["response_chars"], int) for entry in detail_data["call_chain"])
+    assert all((entry["request_chars"], entry["response_chars"]) == (expected_request_chars if entry["id"] == repair else len(json.dumps(
+        {"transport": "openai", "model": "actual-model", "temperature": 0.4, "reasoning_effort": "high", "timeout_seconds": 33, "observability": {"context_char_counts": {"contract": 40, "setting": 60}, "context_chars_total": 100}},
+        ensure_ascii=False,
+    )), expected_response_chars) for entry in detail_data["call_chain"])
+
+
+def test_invalid_model_json_repair_persists_call_level_states(client, monkeypatch):
+    profile = client.post("/api/model-profiles", json={
+        "name": f"R1-A 修复链-{uuid4().hex}",
+        "base_url": "https://example.com/v1",
+        "model": "r1a-repair-model",
+        "api_key": "sk-r1a-repair-test-123456",
+    })
+    assert profile.status_code == 200, profile.text
+    work = client.post("/api/works", json={"title": "非法 JSON 修复链"})
+    work_id = work.json()["id"]
+    summary = "主角在旧档案中发现被篡改的证据，必须在追查真相与保护证人之间作出选择。"
+    while len(summary) < 180:
+        summary += "每一步行动都会改变人物关系、资源代价和最终清算，新的事实也会逼迫主角重新承担选择后果。"
+
+    class Response:
+        usage_metadata = {}
+        response_metadata = {}
+
+        def __init__(self, content):
+            self.content = content
+
+    class FakeClient:
+        def __init__(self):
+            self.responses = [Response("not json"), Response(json.dumps({"story_bible": {"summary": summary}}, ensure_ascii=False))]
+
+        def stream(self, _messages):
+            raise RuntimeError("stream is not supported")
+
+        def invoke(self, _messages):
+            return self.responses.pop(0)
+
+    fake_client = FakeClient()
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", lambda **_kwargs: fake_client)
+    queued = client.post(
+        f"/api/works/{work_id}/generation-jobs",
+        json={
+            "kind": "planning_step",
+            "payload": {"step": "summary", "item_key": "default"},
+            "model_profile_id": profile.json()["id"],
+        },
+    )
+    assert queued.status_code == 202, queued.text
+    assert run_worker_once() is True
+    job_id = queued.json()["id"]
+    job = client.get(f"/api/works/{work_id}/generation-jobs/{job_id}").json()
+    assert job["status"] == "completed", job.get("error")
+    calls = client.get(f"/api/model-call-logs?work_id={work_id}&limit=10").json()["items"]
+    chain = sorted((call for call in calls if call["generation_job_id"] == job_id), key=lambda call: call["created_at"])
+    assert len(chain) == 2
+    assert chain[0]["parse_status"] == "invalid"
+    assert chain[0]["adoption_status"] == "not_adopted"
+    assert chain[0]["failure_category"] == "structure_error"
+    assert chain[1]["repair_of_call_id"] == chain[0]["id"]
+    assert chain[1]["transmission_status"] == "delivered"
+    assert chain[1]["parse_status"] == "success"
+    assert chain[1]["quality_status"] == "passed"
+    assert chain[1]["adoption_status"] == "adopted"
+    assert all(call["effective_parameters"]["transport"] == "openai" for call in chain)
+    assert client.patch(f"/api/model-profiles/{profile.json()['id']}", json={"enabled": False}).status_code == 200
+
+
+def test_model_call_log_character_counts_default_to_zero_for_empty_payloads(client):
+    call_id = model_call_logs.start_model_call({"provider": "test", "model": "empty-model"}, {"request": "will be cleared"})
+    with transaction() as conn:
+        conn.execute("UPDATE model_call_logs SET request_json='' WHERE id=?", (call_id,))
+    model_call_logs.finish_model_call(call_id, status="success", response_text="")
+
+    listed = client.get("/api/model-call-logs?limit=10")
+    item = next(entry for entry in listed.json()["items"] if entry["id"] == call_id)
+    detail = client.get(f"/api/model-call-logs/{call_id}").json()
+    assert item["request_chars"] == item["response_chars"] == 0
+    assert detail["request_chars"] == detail["response_chars"] == 0
+    assert detail["response_text"] == ""
+
+
+def test_model_call_stats_separate_failure_categories(client):
+    created = client.post("/api/works", json={"title": "调用失败分类"})
+    work_id = created.json()["id"]
+    profile = {"provider": "test", "model": "test-model", "base_url": "https://example.test"}
+    for status, error, parse_status, quality_status in (
+        ("timeout", "provider timeout", "not_recorded", "not_recorded"),
+        ("canceled", "用户取消", "not_recorded", "not_recorded"),
+        ("failed", "JSON parse error", "failed", "not_checked"),
+        ("failed", "quality gate failed", "success", "failed"),
+    ):
+        call_id = model_call_logs.start_model_call(profile, {"model": "test-model"}, work_id=work_id)
+        model_call_logs.finish_model_call(
+            call_id,
+            status=status,
+            error=error,
+            parse_status=parse_status,
+            quality_status=quality_status,
+            adoption_status="not_adopted",
+        )
+
+    stats = client.get(f"/api/model-call-logs/stats?work_id={work_id}")
+    assert stats.status_code == 200
+    assert stats.json()["failure_categories"] == {
+        "timeout": 1,
+        "structure_error": 1,
+        "quality_failure": 1,
+        "user_canceled": 1,
+        "transport_failure": 0,
+    }
+
+
+def test_model_call_quality_failure_keeps_transport_and_parse_success(client):
+    created = client.post("/api/works", json={"title": "质检失败不采用"})
+    work_id = created.json()["id"]
+    call_id = model_call_logs.start_model_call(
+        {"provider": "test", "model": "quality-model", "base_url": "https://example.test"},
+        {"transport": "openai", "model": "quality-model", "stream": False},
+        work_id=work_id,
+    )
+    model_call_logs.finish_model_call(
+        call_id,
+        status="success",
+        response_text='{"ok": true}',
+        response={"ok": True},
+        parse_status="success",
+        quality_status="failed",
+        adoption_status="not_adopted",
+    )
+
+    item = next(entry for entry in client.get(f"/api/model-call-logs?work_id={work_id}").json()["items"] if entry["id"] == call_id)
+    assert item["transmission_status"] == "delivered"
+    assert item["parse_status"] == "success"
+    assert item["quality_status"] == "failed"
+    assert item["adoption_status"] == "not_adopted"
+    assert item["failure_category"] == "quality_failure"
+
+
+def test_cast_roster_prompt_and_quality_gate_exclude_protagonist(client, monkeypatch):
+    captured = {}
+
+    def fake_llm(_self, _system, user, *_args, **_kwargs):
+        captured.update(json.loads(user))
+        return {"characters": []}, {},
+
+    monkeypatch.setattr(NovelEngine, "_llm_json_with_usage", fake_llm)
+    context = {"protagonist": [{"character": {"name": "沈峙", "role": "主角"}}]}
+    data, _usage, source = NovelEngine().generate_planning_step(
+        {"title": "阵容规则测试"}, "cast_roster", "default", context,
+    )
+
+    assert data == {"characters": []}
+    assert source == "model"
+    assert "配角、盟友和对手" in captured["cast_roster_rules"]
+    assert "不得包含主角" in captured["schema"]["description"]
+    checks = planning_checks(
+        "cast_roster",
+        {"characters": [{"item_key": "character:1", "name": "沈-峙", "role": "盟友"}]},
+        context,
+    )
+    assert any("不能包含主角" in issue for issue in checks["blocking"])
+
+
+def test_required_character_keys_exclude_protagonist_roster_entry():
+    artifacts = [
+        {"step": "protagonist", "status": "confirmed", "content": {"character": {"name": "沈峙"}}},
+        {"step": "cast_roster", "status": "confirmed", "content": {"characters": [
+            {"item_key": "character:1", "name": "沈-峙"},
+            {"item_key": "character:2", "name": "顾遥"},
+        ]}},
+    ]
+
+    assert _required_character_keys(artifacts) == ["character:2"]
+
+
+def test_cast_roster_with_protagonist_name_cannot_be_confirmed(client):
+    created = client.post("/api/works", json={"title": "阵容确认阻断"})
+    work_id = created.json()["id"]
+    upsert_artifact(work_id, "protagonist", "default", {"character": {
+        "name": "沈峙", "role": "主角",
+        "biography": "沈峙曾因一次沉默让关键证人失去保护，此后他把每个选择都拆成可以核验的证据链，并决心承担公开真相的代价。封锁旧城后，他发现当年的责任被新的权力关系重新利用，只能一边说服不再信任他的同伴，一边承认自己也曾从沉默中获利，最终选择公开真相并接受生活彻底改变。",
+        "goal": "在封锁结束前公开证据并保护愿意作证的同伴",
+        "conflict": "对手持续销毁证据并利用旧案责任逼迫他保持沉默",
+        "motivation": "弥补当年因沉默造成的伤害并承担公开真相的代价",
+        "flaw": "习惯独自确认全部信息后才行动，常常错过保护同伴的时机",
+        "character_arc": "从谨慎旁观转向承担公开真相和关系破裂的代价",
+        "appearance": "身形清瘦但肩背挺直，眉眼有一道旧伤，常穿磨白的深色工装外套，左手指节留着烧伤痕迹。",
+        "personality": "他习惯先记录证据再做判断，遇到威胁时仍会把同伴安全放在选择前面。",
+        "voice": "他说话短而具体，先说明行动和代价，再要求对方回答能否承担后果。",
+    }})
+    confirm_artifact(work_id, "protagonist", "default")
+    roster = {"characters": [{
+        "item_key": "character:1", "name": "沈峙", "role": "盟友",
+        "story_function": "制造行动支点", "relationship_to_protagonist": "与主角互相利用",
+    }]}
+
+    saved = client.put(f"/api/works/{work_id}/planning-steps/cast_roster/default", json={"content": roster})
+    assert saved.status_code == 200
+    blocked = client.post(f"/api/works/{work_id}/planning-steps/cast_roster/default/confirm", json={})
+    assert blocked.status_code == 409
+    assert "不能包含主角" in blocked.text
+    artifact = next(item for item in client.get(f"/api/works/{work_id}/planning-session").json()["artifacts"] if item["step"] == "cast_roster")
+    assert artifact["status"] == "draft"
+
+
+def test_finalize_rejects_legacy_duplicate_protagonist_instead_of_silent_dedupe(client):
+    created = client.post("/api/works", json={"title": "旧重复主角"})
+    work_id = created.json()["id"]
+
+    def save_legacy_confirmed(step, item_key, content):
+        upsert_artifact(work_id, step, item_key, content)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """
+                UPDATE planning_artifacts SET status='confirmed', confirmed_at='legacy'
+                WHERE session_id=(SELECT id FROM planning_sessions WHERE work_id=?)
+                  AND step=? AND item_key=?
+                """,
+                (work_id, step, item_key),
+            )
+            conn.commit()
+
+    save_legacy_confirmed("contract", "contract", {"selected": {"title": "明确方向", "style_rules": "具体行动推动情节"}})
+    save_legacy_confirmed("setting", "default", {"story_bible": {
+        "ending": "主角公开真相并承担代价。",
+        "rules": {"allowed": ["夜间传送"], "forbidden": ["夜间传送"]},
+    }})
+    save_legacy_confirmed("protagonist", "default", {"character": {"name": "沈峙", "role": "主角"}})
+    save_legacy_confirmed("cast_roster", "default", {"characters": [{
+        "item_key": "character:1", "name": "顾遥", "role": "盟友",
+        "story_function": "提供行动支点", "relationship_to_protagonist": "与主角建立信任",
+    }]})
+    save_legacy_confirmed("character", "character:1", {"character": {"name": "顾遥", "role": "盟友"}})
+    save_legacy_confirmed("character", "character:2", {"character": {"name": "沈峙", "role": "主角副本"}})
+    save_legacy_confirmed("arc", "arc:1", {"arc": {"title": "第一卷", "goal": "完成阶段目标"}})
+    save_legacy_confirmed("summary", "default", {"story_bible": {"summary": "一份完整的全书总梗概。"}})
+
+    finalized = client.post(f"/api/works/{work_id}/planning-session/finalize")
+    assert finalized.status_code == 409
+    assert "重复主角" in finalized.text
+    assert "规则直接冲突" in finalized.text
+
+
+def test_finalize_merges_summary_and_selected_contract_fields_stably(client):
+    created = client.post("/api/works", json={"title": "最终合并语义测试"})
+    work_id = created.json()["id"]
+
+    def save_legacy_confirmed(step, item_key, content):
+        upsert_artifact(work_id, step, item_key, content)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """
+                UPDATE planning_artifacts SET status='confirmed', confirmed_at='legacy'
+                WHERE session_id=(SELECT id FROM planning_sessions WHERE work_id=?)
+                  AND step=? AND item_key=?
+                """,
+                (work_id, step, item_key),
+            )
+            conn.commit()
+
+    save_legacy_confirmed("contract", "contract", {
+        "selected": {
+            "title_interpretation": "选中契约解释书名并兑现承诺",
+            "reader_promise": "选中契约承诺主动行动和清晰回报",
+            "style_rules": "被选契约文风，不应覆盖总结文风",
+            "must_have_elements": ["契约元素", "共享元素"],
+            "avoid_drift": ["契约禁区", "共享边界"],
+        },
+        "candidates": [{"title": "被选方向"}, {"title": "被放弃方向", "must_have_elements": ["被放弃元素"]}],
+    })
+    save_legacy_confirmed("setting", "default", {"story_bible": {
+        "world": "世界规则保留有限资源和明确代价。",
+        "ending": "主角公开真相并承担关系破裂的代价。",
+        "must_have_elements": ["设定元素", "共享元素"],
+        "avoid_drift": ["设定禁区", "共享边界"],
+    }})
+    save_legacy_confirmed("protagonist", "default", {"character": {"name": "沈峙", "role": "主角"}})
+    save_legacy_confirmed("cast_roster", "default", {"characters": [{
+        "item_key": "character:1", "name": "顾遥", "role": "盟友",
+    }]})
+    save_legacy_confirmed("character", "character:1", {"character": {"name": "顾遥", "role": "盟友"}})
+    save_legacy_confirmed("arc", "arc:1", {"arc": {"title": "第一卷", "synopsis": "从异常事件开始，主角在阻力中取得阶段性证据并承担新的关系代价。"}})
+    save_legacy_confirmed("summary", "default", {"story_bible": {
+        "summary": "总结步骤提供的最终全书梗概。",
+        "theme": "总结步骤的最终主题",
+        "style_rules": "总结步骤的最终文风规则",
+        "must_have_elements": ["总结新增", "共享元素"],
+        "avoid_drift": ["总结禁区", "共享边界"],
+    }})
+
+    finalized = client.post(f"/api/works/{work_id}/planning-session/finalize")
+    assert finalized.status_code == 200, finalized.text
+    bible = finalized.json()["work"]["story_bible"]
+    assert bible["summary"] == "总结步骤提供的最终全书梗概。"
+    assert bible["theme"] == "总结步骤的最终主题"
+    assert bible["style_rules"] == "总结步骤的最终文风规则"
+    assert bible["title_interpretation"] == "选中契约解释书名并兑现承诺"
+    assert bible["reader_promise"] == "选中契约承诺主动行动和清晰回报"
+    assert bible["must_have_elements"] == ["契约元素", "共享元素", "设定元素", "总结新增"]
+    assert bible["avoid_drift"] == ["契约禁区", "共享边界", "设定禁区", "总结禁区"]
+    assert "被放弃元素" not in json.dumps(bible, ensure_ascii=False)
+    assert isinstance(bible["quality_issues"], list)
+    assert isinstance(bible["quality_score"], int)
+    assert finalized.json()["data"]["consistency_checks"]["ok"] is True
+    assert finalized.json()["data"]["coverage_checks"]["coverage"]["planned_volume_count"] == 1
+
+
 def test_staged_planning_requires_confirmation_and_finalizes(client):
     created = client.post("/api/works", json={"title": "分阶段测试", "genre": "类型小说"})
     assert created.status_code == 200
@@ -918,11 +1884,37 @@ def test_staged_planning_requires_confirmation_and_finalizes(client):
 
     contract = generate("contract", "contract")
     assert len(contract["output"]["data"]["candidates"]) == 3
-    assert client.post(f"/api/works/{work_id}/planning-steps/contract/contract/confirm", json={"candidate_index": 0}).status_code == 200
+    contract_content = contract["output"]["data"]
+    for candidate in contract_content["candidates"]:
+        if len(candidate.get("target_experience", "")) < 20:
+            candidate["target_experience"] += "，并让每次回报都能被读者看见"
+    edited_contract = client.put(
+        f"/api/works/{work_id}/planning-steps/contract/contract",
+        json={"content": contract_content},
+    )
+    assert edited_contract.status_code == 200, edited_contract.text
+    confirmed_contract = client.post(f"/api/works/{work_id}/planning-steps/contract/contract/confirm", json={"candidate_index": 0})
+    assert confirmed_contract.status_code == 200, confirmed_contract.text
     generate("setting")
     assert client.post(f"/api/works/{work_id}/planning-steps/setting/default/confirm", json={}).status_code == 200
-    generate("protagonist")
-    assert client.post(f"/api/works/{work_id}/planning-steps/protagonist/default/confirm", json={}).status_code == 200
+    protagonist_job = generate("protagonist")
+    protagonist_content = protagonist_job["output"]["data"]
+    protagonist_character = protagonist_content["character"]
+    if len(protagonist_character.get("biography", "")) < 120:
+        biography = protagonist_character.get("biography", "")
+        while len(biography) < 120:
+            biography += "这段经历迫使他重新理解责任，并把每一次选择留下的关系代价带到后续行动中。"
+        protagonist_character["biography"] = biography[:260]
+    dramatic_core = protagonist_character.get("dramatic_core") if isinstance(protagonist_character.get("dramatic_core"), dict) else protagonist_character
+    if len(dramatic_core.get("goal", "")) < 20:
+        dramatic_core["goal"] = f"{dramatic_core.get('goal', '')}，并保护愿意作证的同伴"
+    edited_protagonist = client.put(
+        f"/api/works/{work_id}/planning-steps/protagonist/default",
+        json={"content": protagonist_content},
+    )
+    assert edited_protagonist.status_code == 200, edited_protagonist.text
+    confirmed_protagonist = client.post(f"/api/works/{work_id}/planning-steps/protagonist/default/confirm", json={})
+    assert confirmed_protagonist.status_code == 200, confirmed_protagonist.text
     roster = generate("cast_roster")
     assert len(roster["output"]["data"]["characters"]) >= 1
     assert client.post(f"/api/works/{work_id}/planning-steps/cast_roster/default/confirm", json={}).status_code == 200
@@ -942,18 +1934,51 @@ def test_staged_planning_requires_confirmation_and_finalizes(client):
         assert confirmed_character.status_code == 200
         expected_step = "arc" if index == len(roster_characters) - 1 else "character"
         assert confirmed_character.json()["current_step"] == expected_step
-    generate("arc", "arc:1")
-    assert client.post(f"/api/works/{work_id}/planning-steps/arc/arc:1/confirm", json={}).status_code == 200
-    generate("summary")
-    assert client.post(f"/api/works/{work_id}/planning-steps/summary/default/confirm", json={}).status_code == 200
+    arc_job = generate("arc", "arc:1")
+    arc_content = arc_job["output"]["data"]
+    arc = arc_content["arc"]
+    for field in ("goal", "opposition", "turning_point", "ending_state"):
+        if len(arc.get(field, "")) < 20:
+            arc[field] = f"{arc.get(field, '')}，并让本卷的行动后果继续推动下一阶段的冲突"
+    if len(arc.get("synopsis", "")) < 120:
+        synopsis = arc.get("synopsis", "")
+        while len(synopsis) < 120:
+            synopsis += "主角必须在本卷末留下可验证的选择后果，并让对手的升级为下一卷的公开冲突提供明确起点。"
+        arc["synopsis"] = synopsis[:300]
+    edited_arc = client.put(
+        f"/api/works/{work_id}/planning-steps/arc/arc:1",
+        json={"content": arc_content},
+    )
+    assert edited_arc.status_code == 200, edited_arc.text
+    confirmed_arc = client.post(f"/api/works/{work_id}/planning-steps/arc/arc:1/confirm", json={})
+    assert confirmed_arc.status_code == 200, confirmed_arc.text
+    summary_job = generate("summary")
+    summary_bible = summary_job["output"]["data"]["story_bible"]
+    if len(summary_bible.get("summary", "")) < 180:
+        summary = summary_bible.get("summary", "")
+        while len(summary) < 180:
+            summary += "这次选择会继续影响人物关系、资源代价和最终清算，主角必须在每个阶段留下无法轻易撤回的行动后果。"
+        summary_bible["summary"] = summary[:350]
+    if len(summary_bible.get("theme", "")) < 20:
+        summary_bible["theme"] += "，并落实到人物选择和行动后果"
+    wrapped_summary = client.put(
+        f"/api/works/{work_id}/planning-steps/summary/default",
+        json={"content": {"candidate_count": 1, "candidates": [{"story_bible": summary_bible}]}},
+    )
+    assert wrapped_summary.status_code == 200, wrapped_summary.text
+    confirmed_summary = client.post(f"/api/works/{work_id}/planning-steps/summary/default/confirm", json={})
+    assert confirmed_summary.status_code == 200, confirmed_summary.text
 
     finalized = client.post(f"/api/works/{work_id}/planning-session/finalize")
     assert finalized.status_code == 200, finalized.text
     work = finalized.json()["work"]
-    assert work["story_bible"]["summary"]
+    assert work["story_bible"]["summary"] == summary_bible["summary"]
     assert work["characters"]
     assert all(item["appearance"] for item in work["characters"])
     assert all("dramatic_core" in item for item in work["characters"])
+    names = [item["name"] for item in work["characters"]]
+    assert len(names) == len(set(names))
+    assert names.count(names[0]) == 1
     assert work["plot_arcs"]
 
 
@@ -973,11 +1998,36 @@ def test_batch_character_biographies_create_independent_unconfirmed_drafts(clien
         assert detail.json()["status"] == "completed", detail.text
         return detail.json()["output"]
 
-    generate("contract", "contract")
-    assert client.post(f"/api/works/{work_id}/planning-steps/contract/contract/confirm", json={"candidate_index": 0}).status_code == 200
+    contract = generate("contract", "contract")
+    contract_content = contract["data"]
+    for candidate in contract_content["candidates"]:
+        for field in ("target_experience", "protagonist_principle", "power_curve", "payoff_cadence", "power_cost"):
+            if len(candidate.get(field, "")) < 20:
+                candidate[field] = f"{candidate.get(field, '')}，并让每次回报都能被读者看见"
+    edited_contract = client.put(
+        f"/api/works/{work_id}/planning-steps/contract/contract",
+        json={"content": contract_content},
+    )
+    assert edited_contract.status_code == 200, edited_contract.text
+    confirmed_contract = client.post(f"/api/works/{work_id}/planning-steps/contract/contract/confirm", json={"candidate_index": 0})
+    assert confirmed_contract.status_code == 200, confirmed_contract.text
     generate("setting")
     assert client.post(f"/api/works/{work_id}/planning-steps/setting/default/confirm", json={}).status_code == 200
-    generate("protagonist")
+    protagonist = generate("protagonist")
+    protagonist_content = protagonist["data"]
+    protagonist_character = protagonist_content["character"]
+    biography = protagonist_character.get("biography", "")
+    while len(biography) < 120:
+        biography += "这段经历迫使他重新理解责任，并把每一次选择留下的关系代价带到后续行动中。"
+    protagonist_character["biography"] = biography[:260]
+    dramatic_core = protagonist_character.get("dramatic_core") if isinstance(protagonist_character.get("dramatic_core"), dict) else protagonist_character
+    if len(dramatic_core.get("goal", "")) < 20:
+        dramatic_core["goal"] = f"{dramatic_core.get('goal', '')}，并保护愿意作证的同伴"
+    edited_protagonist = client.put(
+        f"/api/works/{work_id}/planning-steps/protagonist/default",
+        json={"content": protagonist_content},
+    )
+    assert edited_protagonist.status_code == 200, edited_protagonist.text
     assert client.post(f"/api/works/{work_id}/planning-steps/protagonist/default/confirm", json={}).status_code == 200
     generate("cast_roster")
     assert client.post(f"/api/works/{work_id}/planning-steps/cast_roster/default/confirm", json={}).status_code == 200
@@ -1019,6 +2069,196 @@ def test_planning_reset_is_guarded_by_existing_chapters(client):
 def test_planning_language_risk_is_explainable():
     risks = language_risks({"text": "这次升级会烧存活率"})
     assert risks and "烧存活率" in risks[0]
+
+
+def test_planning_quality_has_step_specific_lengths_and_natural_language_warnings():
+    short_summary = planning_checks(
+        "summary",
+        {"story_bible": {"summary": "完整故事梗概" * 29}},
+    )
+    assert any("180—350" in issue for issue in short_summary["blocking"])
+
+    short_arc = planning_checks(
+        "arc",
+        {"arc": {
+            "title": "第一卷",
+            "goal": "找到关键证据并保护证人",
+            "opposition": "对手持续制造外部压力",
+            "turning_point": "主角发现责任链指向自己",
+            "ending_state": "证据保住但身份暴露",
+            "synopsis": "卷梗概" * 39,
+        }},
+    )
+    assert any("卷梗概" in issue and "120—300" in issue for issue in short_arc["blocking"])
+
+    warnings = language_risks({"text": "拉林守诚修暖，转守仓对峙。"})
+    assert any("拉林守诚修暖" in warning for warning in warnings)
+    assert any("转守仓对峙" in warning for warning in warnings)
+
+
+def test_planning_consistency_checks_reports_blockers_with_evidence_paths():
+    result = planning_consistency_checks({
+        "contract": [{"selected": {"style_rules": "具体行动推动情节"}}],
+        "setting": [{"story_bible": {
+            "rules": {"allowed": ["夜间传送"], "forbidden": ["夜间传送"]},
+            "goldfinger": {"cost": "失去记忆", "user": "林舟", "scope": "本人", "portable": False},
+        }}],
+        "protagonist": [{"character": {"name": "林舟"}}],
+        "cast_roster": [{"characters": [{"name": "林舟"}, {"name": "林舟"}]}],
+        "arc": [{"arc": {
+            "sequence": 2,
+            "start_chapter": 20,
+            "end_chapter": 10,
+            "twist": {"required_resources": ["血钥匙"], "available_resources": ["旧地图"]},
+        }}],
+    })
+
+    assert result["ok"] is False
+    assert any("重复主角" in issue for issue in result["blocking"])
+    assert any("规则直接冲突" in issue for issue in result["blocking"])
+    assert any("时间范围倒置" in issue for issue in result["blocking"])
+    assert any("尚未获得" in issue for issue in result["blocking"])
+    assert any(item["path"].startswith("context.") and item["suggestion"] for item in result["evidence"])
+
+
+def test_planning_consistency_checks_keeps_plausibility_and_style_as_warnings():
+    result = planning_consistency_checks({
+        "setting": [{"story_bible": {
+            "medical": {"disease": "记忆衰退", "medication": "临时药剂"},
+            "ending": "公开真相并保护证人",
+        }}],
+        "antagonist": {"name": "陆衡"},
+        "arc": [{"arc": {"sequence": 1, "goal": "守住仓库"}}],
+    })
+
+    assert result["ok"] is True
+    assert any("医学因果链" in warning for warning in result["warnings"])
+    assert any("对手设定" in warning for warning in result["warnings"])
+    assert any("文风要求" in warning for warning in result["warnings"])
+    assert result["suggestions"]
+
+
+def test_planning_coverage_checks_blocks_single_confrontation_volume_for_long_book():
+    result = planning_coverage_checks({
+        "estimated_words": 100000,
+        "average_chapter_words": 2500,
+        "target_chapter_count": 40,
+        "story_bible": {
+            "summary": "全书总梗概包含中点反转、最低谷和最终清算。",
+            "ending": "最终对峙后完成结局。",
+        },
+        "plot_arcs": [{"title": "第一卷", "synopsis": "主角与对手最终对峙并暂时收束。", "sequence": 1}],
+    })
+
+    assert result["ok"] is False
+    assert result["full_book_ready"] is False
+    assert any("不能标记为完整全书规划" in issue for issue in result["blocking"])
+    assert result["coverage"]["suggested_volume_count"] == 4
+    assert result["coverage"]["planned_volume_count"] == 1
+    assert result["coverage"]["planned_chapters"] == 40
+    assert result["coverage"]["planned_words"] == 100000
+    assert result["coverage"]["summary_scope"] == "full_book"
+
+    single_volume = planning_coverage_checks({
+        "estimated_words": 100000,
+        "target_chapter_count": 40,
+        "single_volume_complete": True,
+        "story_bible": {"summary": "全书总梗概：中点、最低谷、最终清算均在本卷完成。"},
+        "plot_arcs": [{"title": "单卷完结", "synopsis": "最终对峙后完成最终清算。", "sequence": 1}],
+    })
+    assert not any("不能标记为完整全书规划" in issue for issue in single_volume["blocking"])
+    assert single_volume["coverage"]["single_volume_complete"] is True
+
+
+def test_planning_coverage_checks_reports_current_volume_and_explicit_ranges():
+    result = planning_coverage_checks({
+        "estimated_words": 100000,
+        "average_chapter_words": 2500,
+        "target_chapter_count": 40,
+        "summary_scope": "current_volume",
+        "story_bible": {"summary": "当前卷梗概，完成中段目标，但不是全书总梗概。"},
+        "story_volumes": [{
+            "sequence": 1,
+            "start_chapter": 1,
+            "end_chapter": 12,
+            "target_words": 30000,
+            "synopsis": "本卷推进阶段冲突。",
+        }],
+    })
+
+    coverage = result["coverage"]
+    assert coverage["planned_volume_count"] == 1
+    assert coverage["planned_chapters"] == 12
+    assert coverage["planned_words"] == 30000
+    assert coverage["coverage_ratio"] == 0.3
+    assert coverage["summary_scope"] == "current_volume"
+    assert any("当前卷梗概" in warning for warning in result["warnings"])
+
+
+def test_planning_put_rechecks_content_and_blocks_invalid_confirmation(client):
+    created = client.post("/api/works", json={"title": "质量门保存测试"})
+    work_id = created.json()["id"]
+    valid = {"story_bible": {"summary": "完整故事梗概" * 30}}
+
+    saved = client.put(
+        f"/api/works/{work_id}/planning-steps/summary/default",
+        json={"content": valid},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["checks"]["blocking"] == []
+    assert client.post(f"/api/works/{work_id}/planning-steps/summary/default/confirm", json={}).status_code == 200
+
+    emptied = client.put(
+        f"/api/works/{work_id}/planning-steps/summary/default",
+        json={"content": {"story_bible": {"summary": ""}}},
+    )
+    assert emptied.status_code == 200
+    assert any("总梗概" in issue for issue in emptied.json()["checks"]["blocking"])
+
+    blocked = client.post(f"/api/works/{work_id}/planning-steps/summary/default/confirm", json={})
+    assert blocked.status_code == 409
+    assert "总梗概" in blocked.text
+
+
+def test_r1b_canonical_character_artifact_flows_into_next_step_context(client):
+    created = client.post("/api/works", json={"title": "规范人物结构测试"})
+    work_id = created.json()["id"]
+    character = {
+        "name": "顾遥",
+        "role": "盟友",
+        "story_function": "提供关键行动能力",
+        "biography": "顾遥曾因一次错误判断失去家人，因此决定把证据送到真正能使用它的人手中。她多年在封锁区边缘替人运送物资，熟悉每条检查线的漏洞，也清楚任何一次冒险都会把无辜者拖进旧案。她后来学会把每次行动拆成可核验的步骤，在保护同伴和追查真相之间留下明确的退路，也准备承担退路失效后的关系代价。",
+        "dramatic_core": {
+            "goal": "在证据被销毁前把它送到公开审查的渠道并保护证人",
+            "motivation": "弥补过去失误造成的伤害并让家人得到迟来的解释",
+            "flaw": "过度依赖自己的退路，常常在同伴需要信任时先替他们做决定",
+            "conflict": "不信任主角的犹豫，却又必须借助他的公开身份突破封锁",
+        },
+        "appearance": "短发贴着额角，眉尾有细疤，穿旧防水外套和硬底靴，右手腕留着一圈灼痕作为辨识标记。",
+        "personality": "她先观察退路和代价，再决定是否把别人纳入自己的计划，真正承诺后又极少后退。",
+        "voice": "她说话直接，习惯先报地点、时间和风险，拒绝用含糊的安慰替代行动安排。",
+        "arc": "从只相信个人退路，转向愿意为共同目标承担不可撤回的风险。",
+        "facets": {},
+    }
+    upsert_artifact(work_id, "character", "character:1", {"character": character})
+    assert confirm_artifact(work_id, "character", "character:1")["steps"]
+    context = planning_context_for_step(work_id, "arc")
+    projected = context["character"][0]["character"]
+    assert projected["dramatic_core"]["goal"] == character["dramatic_core"]["goal"]
+    assert projected["arc"] == character["arc"]
+
+
+def test_r1b_frontend_planning_form_uses_canonical_paths_and_safe_editors():
+    source = (Path(__file__).resolve().parents[1] / "web" / "app" / "page.tsx").read_text(encoding="utf-8")
+    assert 'return ["character", "dramatic_core", key]' in source
+    assert '["arc", "人物弧"' in source
+    assert "content.candidates.flatMap" in source
+    assert "normalizePlanningContent" in source
+    assert "delete character[key]" in source
+    assert 'field.valueType === "number"' in source
+    assert "JSON.parse(event.target.value)" in source
+    assert 'await onSave("contract", activeKey, parsed, feedback)' in source
+    assert 'await onSave(selectedStep, activeKey, parsed, feedback)' in source
 
 
 def test_planning_character_check_rejects_repeated_biography():
@@ -1310,6 +2550,87 @@ def test_outline_normalizes_model_phase_label_to_configured_key(client, monkeypa
     assert {item["phase_key"] for item in response.json()["work"]["chapter_plans"]} == {"default"}
 
 
+def test_outline_repairs_only_failed_chapters_and_persists_repair_history(client, monkeypatch):
+    created = client.post("/api/works", json={"title": "定向修复章节", "premise": "主角必须找回一封被篡改的信。"})
+    work_id = created.json()["id"]
+    assert client.post(f"/api/works/{work_id}/generate/setup").status_code == 200
+
+    original_generate = engine.generate_outline
+    repair_calls = []
+
+    def generate_with_two_invalid_chapters(*args, **kwargs):
+        result = original_generate(*args, **kwargs)
+        result["chapters"][0]["title"] = ""
+        result["chapters"][2]["phase_key"] = ""
+        return result
+
+    def repair_failed_chapters(work, failed_chapters, issues_by_chapter, profile=None, *, generation_context=None):
+        repair_calls.append({"numbers": [item["chapter_no"] for item in failed_chapters], "issues": issues_by_chapter})
+        repaired = []
+        for entry in failed_chapters:
+            chapter = dict(entry["chapter"])
+            if chapter["chapter_no"] == 1:
+                chapter["title"] = "修复后的开门"
+            if chapter["chapter_no"] == 3:
+                chapter["phase_key"] = "default"
+            repaired.append(chapter)
+        return {"chapters": repaired, "generation_source": "model", "repair_attempts": 1}
+
+    monkeypatch.setattr(engine, "generate_outline", generate_with_two_invalid_chapters)
+    monkeypatch.setattr(engine, "repair_outline_chapters", repair_failed_chapters)
+    response = client.post(f"/api/works/{work_id}/generate/outline", json={"chapter_count": 3})
+
+    assert response.status_code == 200, response.text
+    assert repair_calls and repair_calls[0]["numbers"] == [1, 3]
+    data = response.json()["data"]
+    assert data["repair_count"] == 1
+    history = data["repair_history"][0]
+    assert history["scope"] == "chapters"
+    assert history["chapter_numbers"] == [1, 3]
+    assert history["original_output"][0]["title"] == ""
+    assert history["issues"]["1"]
+    assert response.json()["work"]["chapter_plans"][0]["title"] == "修复后的开门"
+    versions = client.get(f"/api/works/{work_id}/outline-versions").json()["items"]
+    assert versions[0]["request"]["repair_history"][0]["chapter_numbers"] == [1, 3]
+
+
+def test_outline_repairs_the_whole_batch_only_for_structural_failure(client, monkeypatch):
+    created = client.post("/api/works", json={"title": "整批结构修复", "premise": "主角必须修复一段被篡改的记忆。"})
+    work_id = created.json()["id"]
+    assert client.post(f"/api/works/{work_id}/generate/setup").status_code == 200
+
+    original_generate = engine.generate_outline
+    repair_calls = []
+
+    def generate_with_missing_chapters(*args, **kwargs):
+        result = original_generate(*args, **kwargs)
+        result["chapters"] = result["chapters"][:1]
+        return result
+
+    def repair_whole_batch(work, failed_chapters, issues_by_chapter, profile=None, *, generation_context=None):
+        repair_calls.append({"numbers": [item["chapter_no"] for item in failed_chapters], "issues": issues_by_chapter})
+        result = original_generate(
+            work,
+            len(failed_chapters),
+            profile,
+            generation_context={
+                **(generation_context or {}),
+                "from_chapter": failed_chapters[0]["chapter_no"],
+                "to_chapter": failed_chapters[-1]["chapter_no"],
+            },
+        )
+        return {"chapters": result["chapters"], "generation_source": "fallback"}
+
+    monkeypatch.setattr(engine, "generate_outline", generate_with_missing_chapters)
+    monkeypatch.setattr(engine, "repair_outline_chapters", repair_whole_batch)
+    response = client.post(f"/api/works/{work_id}/generate/outline", json={"chapter_count": 3})
+
+    assert response.status_code == 200, response.text
+    assert repair_calls and repair_calls[0]["numbers"] == [1, 2, 3]
+    assert "batch" in response.json()["data"]["repair_history"][0]["scope"]
+    assert len(response.json()["work"]["chapter_plans"]) == 3
+
+
 def test_long_book_uses_global_target_but_only_generates_a_detail_window(client):
     created = client.post("/api/works", json={
         "title": "三百万字长篇", "premise": "末世幸存者从一支小队起步。",
@@ -1426,10 +2747,14 @@ def test_v2_long_term_facts_future_plans_and_goal_lifecycle(client):
 def test_saving_contract_draft_then_confirming_advances_step(client):
     created = client.post("/api/works", json={"title": "保存契约测试"})
     work_id = created.json()["id"]
-    content = {"candidates": [{"title": "方向一", "target_experience": "明确回报"}, {"title": "方向二"}, {"title": "方向三"}]}
+    content = {"candidates": [
+        {"title": "方向一", "target_experience": "明确回报并让每次选择都留下可见后果，并推动下一步行动", "body": "具体行动推动情节并保持明确回报节奏和人物选择" * 6},
+        {"title": "方向二", "body": "具体行动推动情节并保持明确回报节奏和人物选择" * 6},
+        {"title": "方向三", "body": "具体行动推动情节并保持明确回报节奏和人物选择" * 6},
+    ]}
     saved = client.put(f"/api/works/{work_id}/planning-steps/contract/contract", json={"content": content})
     assert saved.status_code == 200
     assert saved.json()["status"] == "draft"
     confirmed = client.post(f"/api/works/{work_id}/planning-steps/contract/contract/confirm", json={"candidate_index": 0})
-    assert confirmed.status_code == 200
+    assert confirmed.status_code == 200, confirmed.text
     assert confirmed.json()["current_step"] == "setting"

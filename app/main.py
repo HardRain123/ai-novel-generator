@@ -58,13 +58,16 @@ from app.services.planning_repository import (
     confirm_artifact,
     finalize_planning,
     get_planning_session,
+    list_planning_snapshots,
     prerequisite_error,
     reset_planning,
+    restore_planning_snapshot,
     update_artifact_content,
 )
 from app.services.foreshadows import create_foreshadow, delete_foreshadow, foreshadow_stats, list_foreshadows, update_foreshadow
 from app.services.model_profiles import bootstrap_legacy_profile, codex_auth_status, create_profile, delete_profile, fetch_models, get_profile, list_profiles, preset, profile_for_task, resolve_profile, test_profile, update_profile
 from app.services.model_call_logs import get_model_call, list_model_calls, model_call_stats
+from app.services.planning_quality import planning_field_rules
 from app.services.trends import SOURCE_CONFIG, analyze_trends, get_analysis, get_blueprint, search_trends
 from app.services.repository import (
     create_work,
@@ -134,6 +137,12 @@ def _record_generation(conn, work_id: str, kind: str, input_data: dict, output_d
 def health():
     configured = bool(LLM_API_KEY or any(item.get("has_api_key") or (item.get("provider") == "codex_auth" and item.get("last_test_status") == "ok") for item in list_profiles()))
     return {"status": "ok", "service": "ai-novel-generator", "mode": "live" if configured else "demo", "model_configured": configured}
+
+
+@app.get("/api/planning-rules")
+def planning_rules():
+    """Expose the planning editor's server-side quality contract."""
+    return planning_field_rules()
 
 
 @app.get("/api/model-profiles")
@@ -266,8 +275,8 @@ def model_call_log_list(
 
 
 @app.get("/api/model-call-logs/stats")
-def model_call_log_stats():
-    return model_call_stats()
+def model_call_log_stats(work_id: str | None = None):
+    return model_call_stats(work_id=work_id)
 
 
 @app.get("/api/model-call-logs/{call_id}")
@@ -436,6 +445,23 @@ def update_planning_artifact(work_id: str, step: str, item_key: str, payload: Pl
     if step not in STEP_ORDER:
         raise HTTPException(status_code=422, detail="不支持的规划步骤")
     return update_artifact_content(work_id, step, item_key, payload.content, payload.feedback)
+
+
+@app.get("/api/works/{work_id}/planning-snapshots")
+def planning_snapshots(work_id: str, step: str, item_key: str = "default"):
+    _work_or_404(work_id)
+    if step not in STEP_ORDER:
+        raise HTTPException(status_code=422, detail="不支持的规划步骤")
+    return {"items": list_planning_snapshots(work_id, step, item_key)}
+
+
+@app.post("/api/works/{work_id}/planning-snapshots/{snapshot_id}/restore")
+def restore_snapshot(work_id: str, snapshot_id: str):
+    _work_or_404(work_id)
+    try:
+        return restore_planning_snapshot(work_id, snapshot_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.post("/api/works/{work_id}/planning-steps/{step}/{item_key}/confirm")
@@ -749,7 +775,8 @@ def generate_outline(work_id: str, payload: GenerateOutlineRequest):
         with transaction() as conn:
             saved = save_outline(
                 conn, work_id, data.get("chapters", []), mode=data["mode"],
-                from_chapter=data["from_chapter"], to_chapter=data["to_chapter"], request=request,
+                from_chapter=data["from_chapter"], to_chapter=data["to_chapter"],
+                request={**request, **({"repair_history": data["repair_history"]} if data.get("repair_history") else {})},
                 expected_outline_version=payload.expected_outline_version,
                 expected_fact_version=data["fact_version"] if payload.expected_fact_version is None else payload.expected_fact_version,
             )
