@@ -20,8 +20,8 @@ try {
     Pop-Location
 }
 
-$pyInstaller = & $python -c "import shutil; print(shutil.which('pyinstaller') or '')"
-if (-not $pyInstaller) { throw "未安装 PyInstaller。请先运行：uv sync --dev" }
+& $python -c "import PyInstaller; print(PyInstaller.__version__)"
+if ($LASTEXITCODE -ne 0) { throw "未安装 PyInstaller。请先运行：uv sync --dev" }
 
 $release = Join-Path $root "release"
 $build = Join-Path $root ".build\pyinstaller"
