@@ -48,11 +48,14 @@ type GenerationJob = { id: string; kind: string; status: string; error: string; 
 type ModelCallStats = { total: number; today: number; success: number; failed: number; success_rate: number; avg_duration_ms?: number | null; p95_duration_ms?: number | null; total_tokens: number; failure_categories?: Record<string, number> };
 type ModelCall = { id: string; work_id?: string | null; work_title?: string | null; generation_job_id?: string | null; generation_task_url?: string | null; model_profile_id?: string | null; call_kind: string; task_name?: string; planning_step?: string | null; item_key?: string | null; provider: string; model: string; base_url: string; status: string; transmission_status?: string; parse_status?: string; quality_status?: string; adoption_status?: string; failure_category?: string | null; generation_status?: string | null; repair_of_call_id?: string | null; context_char_counts?: Record<string, number>; context_chars_total?: number; context_char_shares?: Record<string, number>; effective_parameters?: Record<string, unknown>; error: string; started_at: string; first_output_at?: string | null; completed_at?: string | null; duration_ms?: number | null; first_output_ms?: number | null; input_tokens?: number | null; output_tokens?: number | null; total_tokens?: number | null; created_at: string; request_chars?: number | null; response_chars?: number | null };
 type ModelCallDetail = Omit<ModelCall, "request_chars" | "response_chars"> & { request: unknown; response: unknown; response_text: string; request_chars?: number | null; response_chars?: number | null; call_chain?: ModelCall[]; chain_root_call_id?: string };
-type PlanningArtifact = { id: string; step: string; item_key: string; content: Record<string, any>; status: string; version: number; source: string; feedback: string; checks: { blocking?: string[]; warnings?: string[]; ok?: boolean }; parent_versions: Record<string, number>; input_tokens?: number | null; output_tokens?: number | null; total_tokens?: number | null; model?: string };
+type PlanningContent = Record<string, unknown>;
+type PlanningRosterItem = PlanningContent & { item_key: string; name?: string; role?: string; story_function?: string; relationship_to_protagonist?: string };
+type PlanningCandidate = PlanningContent & { title?: string; target_experience?: string; protagonist_principle?: string; power_curve?: string; payoff_cadence?: string; moral_boundary?: string; forbidden?: string[] };
+type PlanningArtifact = { id: string; step: string; item_key: string; content: PlanningContent; status: string; version: number; source: string; feedback: string; checks: { blocking?: string[]; warnings?: string[]; ok?: boolean }; parent_versions: Record<string, number>; input_tokens?: number | null; output_tokens?: number | null; total_tokens?: number | null; model?: string };
 type PlanningStep = { step: string; label: string; description: string; status: string; items: PlanningArtifact[] };
-type PlanningSnapshot = { id: string; artifact_id: string; step: string; item_key: string; content: Record<string, any>; status: string; version: number; source: string; feedback: string; checks: Record<string, any>; created_at: string };
+type PlanningSnapshot = { id: string; artifact_id: string; step: string; item_key: string; content: PlanningContent; status: string; version: number; source: string; feedback: string; checks: PlanningContent; created_at: string };
 type PlanningCoverage = { blocking: string[]; warnings: string[]; full_book_ready: boolean; coverage: { estimated_words: number; average_chapter_words: number; target_chapters: number; suggested_volume_count: number; planned_volume_count: number; planned_chapters: number; planned_words: number; coverage_ratio: number; chapter_estimate: string; opening_planned?: boolean; escalation_planned?: boolean; midpoint_planned?: boolean; low_point_planned?: boolean; final_reckoning_planned?: boolean; summary_scope?: string; single_volume_complete?: boolean } };
-type PlanningSession = { id: string; work_id: string; status: string; current_step: string; preset: string; steps: PlanningStep[]; artifacts: PlanningArtifact[]; usage: { input_tokens: number; output_tokens: number; total_tokens: number; known: boolean }; coverage_checks?: PlanningCoverage; presets?: Record<string, Record<string, any>> };
+type PlanningSession = { id: string; work_id: string; status: string; current_step: string; preset: string; steps: PlanningStep[]; artifacts: PlanningArtifact[]; usage: { input_tokens: number; output_tokens: number; total_tokens: number; known: boolean }; coverage_checks?: PlanningCoverage; presets?: Record<string, PlanningContent> };
 type Foreshadow = { id: string; clue: string; kind: string; planted_chapter: number; expected_reveal_chapter: number; actual_reveal_chapter: number; status: string; note: string; evidence: string };
 type TrendItem = { id: string; source: string; rank: number; board: string; category: string; title: string; author: string; synopsis: string; metric_label: string; metric_value: string; source_url: string; captured_at: string };
 type TrendSourceModel = { id?: string; trend_item_id: string; completeness: string; model: { market_positioning?: string; narrative_engine?: { opening?: string; protagonist?: string; conflict?: string; stakes?: string }; serial_engine?: { payoff_cadence?: string; hook_types?: string[] }; safe_signals?: string[]; avoid_copying?: string[] } };
@@ -144,14 +147,17 @@ export default function Home() {
   const planningRequestVersion = useRef(0);
 
   useEffect(() => {
-    const path = window.location.pathname;
-    if (path.startsWith("/trends")) setGlobalView("trends");
-    else if (path.startsWith("/settings/models")) setGlobalView("settings");
-    else if (path.startsWith("/model-calls")) setGlobalView("calls");
-    else {
-      const match = path.match(/^\/works\/([^/]+)/);
-      if (match) setSelectedId(decodeURIComponent(match[1]));
-    }
+    const timer = window.setTimeout(() => {
+      const path = window.location.pathname;
+      if (path.startsWith("/trends")) setGlobalView("trends");
+      else if (path.startsWith("/settings/models")) setGlobalView("settings");
+      else if (path.startsWith("/model-calls")) setGlobalView("calls");
+      else {
+        const match = path.match(/^\/works\/([^/]+)/);
+        if (match) setSelectedId(decodeURIComponent(match[1]));
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, []);
 
   const refreshWorks = useCallback(async () => {
@@ -336,7 +342,7 @@ export default function Home() {
     } catch (e) { setError((e as Error).message); } finally { setBusy(""); }
   }
 
-  async function savePlanningArtifact(step: string, itemKey: string, content: Record<string, any>, feedback: string) {
+  async function savePlanningArtifact(step: string, itemKey: string, content: PlanningContent, feedback: string) {
     if (!work) return;
     try {
       await api(`/works/${work.id}/planning-steps/${encodeURIComponent(step)}/${encodeURIComponent(itemKey)}`, { method: "PUT", body: JSON.stringify({ content, feedback }) });
@@ -475,7 +481,7 @@ export default function Home() {
           <div><div className="eyebrow">AI NOVEL STUDIO / MVP</div><h1>{work?.title || "开始你的第一部长篇"}</h1><p className="subtitle">先给 AI 一个方向，剩下的由故事规划、正文生成和作品状态共同推进。</p><span className={`connection ${healthMode}`}>{healthMode === "live" ? "● AI 已连接" : "● 演示模式：未配置模型"}</span>{work && <label className="work-model">本作品模型<select value={work.model_profile_id || ""} onChange={(e) => setWorkProfile(e.target.value)}><option value="">使用默认模型</option>{profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name} · {profile.model}</option>)}</select></label>}</div>
           {work && <div className="top-actions"><button className="button" onClick={() => downloadWork(work)}>导出 Markdown</button><button className="button danger" onClick={deleteWork} disabled={!!busy}>删除作品</button><button className="button primary" onClick={() => setTab("assets")} disabled={!!busy}>{planning?.status === "completed" ? "查看故事档案" : planning?.current_step === "contract" ? "开始故事档案" : "继续故事档案"}</button><label className="chapter-count">章数<input type="number" min="1" max="200" value={chapterCount} onChange={(e) => setChapterCount(Math.max(1, Math.min(200, Number(e.target.value) || 12)))} /></label><button className="button dark" onClick={() => generate("outline")} disabled={!!busy || planning?.status !== "completed"}>{busy === "outline" ? "正在拆大纲…" : planning?.status === "completed" ? `生成 ${chapterCount} 章大纲` : "完成故事档案后生成大纲"}</button></div>}
         </div>
-        {activeJob && <GenerationProgress job={activeJob} workId={work?.id || selectedId} onCancel={() => api(`/works/${work?.id || selectedId}/generation-jobs/${activeJob.id}/cancel`, { method: "POST" }).then((job) => setActiveJob(job as GenerationJob)).catch((e) => setError(e.message))} onRetry={retryActiveJob} />}
+        {activeJob && <GenerationProgress job={activeJob} onCancel={() => api(`/works/${work?.id || selectedId}/generation-jobs/${activeJob.id}/cancel`, { method: "POST" }).then((job) => setActiveJob(job as GenerationJob)).catch((e) => setError(e.message))} onRetry={retryActiveJob} />}
         {error && <div className="notice">{error}</div>}
         {!work ? <CreatePanel busy={busy} profiles={profiles} onCreate={createWork} /> : <>
           <div className="grid"><div className="card stat span-4"><span className="stat-label">预计篇幅</span><span className="stat-value">{(work.estimated_words / 10000).toFixed(1)}万字</span></div><div className="card stat span-4"><span className="stat-label">章节进度</span><span className="stat-value">{work.chapters?.length || 0} <small className="muted">/ {work.chapter_plans?.length || "—"}</small></span></div><div className="card stat span-4"><span className="stat-label">作品资产</span><span className="stat-value">{(work.characters?.length || 0) + (work.foreshadows?.length || 0)} <small className="muted">项</small></span></div></div>
@@ -524,7 +530,7 @@ function generationStatusLabels(output: Record<string, unknown>) {
   };
 }
 
-function GenerationProgress({ job, workId, onCancel, onRetry }: { job: GenerationJob; workId: string; onCancel: () => void; onRetry: () => void }) {
+function GenerationProgress({ job, onCancel, onRetry }: { job: GenerationJob; onCancel: () => void; onRetry: () => void }) {
   const terminal = ["completed", "failed", "canceled"].includes(job.status);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -548,12 +554,12 @@ type PlanningFieldSpec = { key: string; label: string; path: string[]; min?: num
 
 const PLANNING_NUMERIC_FIELDS = new Set(["sequence", "start_chapter", "end_chapter"]);
 
-function isPlanningRecord(value: unknown): value is Record<string, any> {
+function isPlanningRecord(value: unknown): value is PlanningContent {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function normalizePlanningContent(step: string, content: Record<string, any>): Record<string, any> {
-  const next = JSON.parse(JSON.stringify(content || {})) as Record<string, any>;
+function normalizePlanningContent(step: string, content: PlanningContent): PlanningContent {
+  const next = JSON.parse(JSON.stringify(content || {})) as PlanningContent;
   if (step === "protagonist" || step === "character") {
     const character = isPlanningRecord(next.character) ? next.character : {};
     const existingCore = isPlanningRecord(character.dramatic_core) ? character.dramatic_core : {};
@@ -582,20 +588,22 @@ function normalizePlanningContent(step: string, content: Record<string, any>): R
   return next;
 }
 
-function planningFieldValue(content: Record<string, any>, path: string[]): string {
-  let value: any = content;
-  for (const part of path) value = value == null ? undefined : value[part];
+function planningFieldValue(content: PlanningContent, path: string[]): string {
+  const value = planningFieldRawValue(content, path);
   if (value == null) return "";
   return typeof value === "string" || typeof value === "number" ? String(value) : JSON.stringify(value);
 }
 
-function planningFieldRawValue(content: Record<string, any>, path: string[]): unknown {
+function planningFieldRawValue(content: PlanningContent, path: string[]): unknown {
   let value: unknown = content;
-  for (const part of path) value = isPlanningRecord(value) || Array.isArray(value) ? value[part as keyof typeof value] : undefined;
+  for (const part of path) {
+    if (Array.isArray(value)) value = value[Number(part)];
+    else value = isPlanningRecord(value) ? value[part] : undefined;
+  }
   return value;
 }
 
-function planningFieldPath(content: Record<string, any>, step: string, key: string, index?: number): string[] {
+function planningFieldPath(content: PlanningContent, step: string, key: string, index?: number): string[] {
   if (step === "contract") {
     if (content.selected && typeof content.selected === "object") return ["selected", key];
     if (Array.isArray(content.candidates) && index != null && content.candidates[index]) return ["candidates", String(index), key];
@@ -611,7 +619,7 @@ function planningFieldPath(content: Record<string, any>, step: string, key: stri
   return [key];
 }
 
-function planningFieldSpecs(step: string, content: Record<string, any>, rules: PlanningRules): PlanningFieldSpec[] {
+function planningFieldSpecs(step: string, content: PlanningContent, rules: PlanningRules): PlanningFieldSpec[] {
   const ruleFor = (key: string): PlanningRule => rules.steps[step]?.[key] || rules.default_rule;
   const simple = (fields: Array<[string, string, boolean?]>, index?: number, prefix = "") => fields.map(([key, label, multiline]) => {
     const rule = ruleFor(key);
@@ -631,7 +639,7 @@ function planningFieldSpecs(step: string, content: Record<string, any>, rules: P
   if (step === "contract") {
     if (isPlanningRecord(content.selected)) return simple(contractFields, undefined, "已选方向");
     if (Array.isArray(content.candidates) && content.candidates.length) {
-      return content.candidates.flatMap((_candidate: Record<string, any>, index: number) => simple(contractFields, index, `方向 ${index + 1}`));
+      return content.candidates.flatMap((_candidate: unknown, index: number) => simple(contractFields, index, `方向 ${index + 1}`));
     }
     return simple(contractFields);
   }
@@ -648,8 +656,8 @@ function planningFieldSpecs(step: string, content: Record<string, any>, rules: P
   ]);
   if (step === "cast_roster") {
     const characters = Array.isArray(content.characters) ? content.characters : [];
-    return characters.flatMap((character: Record<string, any>, index: number) => simple([
-      ["name", `${character.name || `角色 ${index + 1}`} · 姓名`], ["role", "身份"],
+    return characters.flatMap((character: unknown, index: number) => simple([
+      ["name", `${isPlanningRecord(character) ? String(character.name || `角色 ${index + 1}`) : `角色 ${index + 1}`} · 姓名`], ["role", "身份"],
       ["story_function", "剧情作用", true], ["relationship_to_protagonist", "与主角关系", true],
     ], index));
   }
@@ -665,20 +673,30 @@ function planningFieldSpecs(step: string, content: Record<string, any>, rules: P
   return [];
 }
 
-function setPlanningField(content: Record<string, any>, path: string[], value: unknown): Record<string, any> {
-  const next = JSON.parse(JSON.stringify(content)) as Record<string, any>;
-  let cursor: any = next;
+function setPlanningField(content: PlanningContent, path: string[], value: unknown): PlanningContent {
+  const next = JSON.parse(JSON.stringify(content)) as PlanningContent;
+  let cursor: PlanningContent | unknown[] = next;
   path.forEach((part, index) => {
-    if (index === path.length - 1) { cursor[part] = value; return; }
+    const numericKey = Number(part);
+    if (index === path.length - 1) {
+      if (Array.isArray(cursor)) cursor[numericKey] = value;
+      else cursor[part] = value;
+      return;
+    }
     const child = path[index + 1];
-    if (!cursor[part] || typeof cursor[part] !== "object") cursor[part] = /^\d+$/.test(child) ? [] : {};
-    cursor = cursor[part];
+    let current = Array.isArray(cursor) ? cursor[numericKey] : cursor[part];
+    if (!current || typeof current !== "object") {
+      current = /^\d+$/.test(child) ? [] : {};
+      if (Array.isArray(cursor)) cursor[numericKey] = current;
+      else cursor[part] = current;
+    }
+    cursor = current as PlanningContent | unknown[];
   });
   return next;
 }
 
 function PlanningFieldForm({ step, draftText, rules, onChange }: { step: string; draftText: string; rules: PlanningRules | null; onChange: (value: string) => void }) {
-  let content: Record<string, any> | null = null;
+  let content: PlanningContent | null = null;
   try { content = JSON.parse(draftText); } catch { content = null; }
   if (!content) return <div className="notice">{draftText.trim() ? "内容格式有误，暂时无法显示编辑表单。请在高级编辑中修正，或重新生成这一步。" : "这一步还没有内容，点击下方“生成当前步骤”开始。"}</div>;
   if (!rules) return <div className="notice">正在准备编辑内容，请稍候…</div>;
@@ -726,7 +744,7 @@ function PlanningWizard({ work, planning, busy, onGenerate, onGenerateAllCharact
   busy: string;
   onGenerate: (step: string, itemKey: string, feedback: string, preset: string) => Promise<void>;
   onGenerateAllCharacters: (preset: string, feedback: string) => Promise<void>;
-  onSave: (step: string, itemKey: string, content: Record<string, any>, feedback: string) => Promise<void>;
+  onSave: (step: string, itemKey: string, content: PlanningContent, feedback: string) => Promise<void>;
   onRestore: (snapshotId: string) => Promise<void>;
   onConfirm: (step: string, itemKey: string, candidateIndex?: number) => Promise<PlanningSession | undefined>;
   onFinalize: () => Promise<void>;
@@ -739,13 +757,13 @@ function PlanningWizard({ work, planning, busy, onGenerate, onGenerateAllCharact
   const [draftText, setDraftText] = useState("");
   const [saveMessage, setSaveMessage] = useState("");
   const [snapshots, setSnapshots] = useState<PlanningSnapshot[]>([]);
-  const [diff, setDiff] = useState<{ before: Record<string, any>; after: Record<string, any> } | null>(null);
+  const [diff, setDiff] = useState<{ before: PlanningContent; after: PlanningContent } | null>(null);
   const [planningRules, setPlanningRules] = useState<PlanningRules | null>(null);
-  const pendingGenerated = useRef<{ step: string; itemKey: string; version: number; before: Record<string, any> } | null>(null);
+  const pendingGenerated = useRef<{ step: string; itemKey: string; version: number; before: PlanningContent } | null>(null);
   const previousCurrentStep = useRef(planning.current_step);
   const step = planning.steps.find((item) => item.step === selectedStep) || planning.steps[0];
   const items = step?.items || [];
-  const rosterList = (planning.steps.find((item) => item.step === "cast_roster")?.items[0]?.content?.characters || []) as Record<string, any>[];
+  const rosterList = (planning.steps.find((item) => item.step === "cast_roster")?.items[0]?.content?.characters || []) as PlanningRosterItem[];
   const characterItems = planning.steps.find((item) => item.step === "character")?.items || [];
   const draftedCharacterKeys = new Set(characterItems.map((item) => item.item_key));
   const pendingCharacters = rosterList.filter((item) => item.item_key && !draftedCharacterKeys.has(item.item_key));
@@ -756,11 +774,17 @@ function PlanningWizard({ work, planning, busy, onGenerate, onGenerateAllCharact
   useEffect(() => {
     if (previousCurrentStep.current !== planning.current_step) {
       previousCurrentStep.current = planning.current_step;
-      if (planning.current_step !== "complete") setSelectedStep(planning.current_step);
+      if (planning.current_step !== "complete") {
+        const timer = window.setTimeout(() => setSelectedStep(planning.current_step), 0);
+        return () => window.clearTimeout(timer);
+      }
     }
   }, [planning.current_step]);
   useEffect(() => {
-    setSelectedItemKey(""); setFeedback(""); setSaveMessage(""); setDiff(null);
+    const timer = window.setTimeout(() => {
+      setSelectedItemKey(""); setFeedback(""); setSaveMessage(""); setDiff(null);
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [selectedStep]);
   useEffect(() => {
     let disposed = false;
@@ -770,24 +794,29 @@ function PlanningWizard({ work, planning, busy, onGenerate, onGenerateAllCharact
     return () => { disposed = true; };
   }, []);
   useEffect(() => {
-    setDraftText(activeItem ? JSON.stringify(activeItem.content, null, 2) : "");
-    setFeedback(activeItem?.feedback || "");
-    const pending = pendingGenerated.current;
-    if (pending && activeItem && pending.step === selectedStep && pending.itemKey === activeKey && activeItem.version > pending.version) {
-      setDiff({ before: pending.before, after: activeItem.content });
-      pendingGenerated.current = null;
-    }
-  }, [activeItem?.id, activeItem?.version, selectedStep, activeKey]);
+    const timer = window.setTimeout(() => {
+      setDraftText(activeItem ? JSON.stringify(activeItem.content, null, 2) : "");
+      setFeedback(activeItem?.feedback || "");
+      const pending = pendingGenerated.current;
+      if (pending && activeItem && pending.step === selectedStep && pending.itemKey === activeKey && activeItem.version > pending.version) {
+        setDiff({ before: pending.before, after: activeItem.content });
+        pendingGenerated.current = null;
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [activeItem, selectedStep, activeKey]);
   useEffect(() => {
     let disposed = false;
-    setSnapshots([]);
-    api<{ items: PlanningSnapshot[] }>(`/works/${work.id}/planning-snapshots?step=${encodeURIComponent(selectedStep)}&item_key=${encodeURIComponent(activeKey)}`)
-      .then((data) => { if (!disposed) setSnapshots(data.items); })
-      .catch(() => undefined);
-    return () => { disposed = true; };
+    const timer = window.setTimeout(() => {
+      setSnapshots([]);
+      api<{ items: PlanningSnapshot[] }>(`/works/${work.id}/planning-snapshots?step=${encodeURIComponent(selectedStep)}&item_key=${encodeURIComponent(activeKey)}`)
+        .then((data) => { if (!disposed) setSnapshots(data.items); })
+        .catch(() => undefined);
+    }, 0);
+    return () => { disposed = true; window.clearTimeout(timer); };
   }, [work.id, selectedStep, activeKey, activeItem?.version]);
 
-  const candidateList = (activeItem?.content?.candidates || []) as Record<string, any>[];
+  const candidateList = (activeItem?.content?.candidates || []) as PlanningCandidate[];
   const blockingIssues = activeItem?.checks?.blocking || [];
   const hasBlockingIssues = blockingIssues.length > 0;
   const canFinalize = planning.steps.every((item) => item.status === "confirmed") && planning.status !== "completed";
@@ -796,7 +825,7 @@ function PlanningWizard({ work, planning, busy, onGenerate, onGenerateAllCharact
     ["最低谷", coverage?.low_point_planned], ["结局", coverage?.final_reckoning_planned],
   ] as [string, boolean | undefined][];
 
-  function parseDraft(): Record<string, any> | null {
+  function parseDraft(): PlanningContent | null {
     try {
       const parsed = JSON.parse(draftText);
       return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? normalizePlanningContent(selectedStep, parsed) : null;
@@ -855,7 +884,7 @@ function PlanningWizard({ work, planning, busy, onGenerate, onGenerateAllCharact
   return <><>{brief && <div className="notice inspiration-brief"><strong>原创蓝图已接入本次规划。</strong> 吸收：{(brief.market_signals || []).join("；") || "抽象市场信号"}。必须重构：{(brief.transformation_contract?.change || []).join("；")}。</div>}</><div className="planning-layout">
     <div className="card planning-sidebar">
       <div className="toolbar"><div><h2>故事档案向导</h2><p className="subtitle">每一步确认后，下一步才会引用它。</p></div><button className="button" onClick={onReset} disabled={!!busy}>重置</button></div>
-      <div className="planning-preset field"><label>创作契约预设</label><select value={preset} onChange={(event) => setPreset(event.target.value)}>{Object.entries(planning.presets || {}).map(([key, value]) => <option key={key} value={key}>{value.name || key}</option>)}</select></div>
+      <div className="planning-preset field"><label>创作契约预设</label><select value={preset} onChange={(event) => setPreset(event.target.value)}>{Object.entries(planning.presets || {}).map(([key, value]) => <option key={key} value={key}>{String(value.name || key)}</option>)}</select></div>
       <div className="planning-steps">{planning.steps.map((item) => <button key={item.step} className={`planning-step ${selectedStep === item.step ? "active" : ""}`} onClick={() => setSelectedStep(item.step)}><span>{PLANNING_STATUS_LABEL[item.status] || item.status}</span><strong>{item.label}</strong><small>{item.description}</small></button>)}</div>
       <div className="notice token-notice">本次会话：输入 {planning.usage.known ? planning.usage.input_tokens : "未知"} · 输出 {planning.usage.known ? planning.usage.output_tokens : "未知"} · 总计 {planning.usage.known ? planning.usage.total_tokens : "未知"}</div>
     </div>
@@ -865,7 +894,7 @@ function PlanningWizard({ work, planning, busy, onGenerate, onGenerateAllCharact
       {selectedStep === "character" && rosterList.length > 0 && <div className="planning-subitems"><div className="toolbar"><div><strong>选择要生成的人物</strong><p className="muted">待生成 {pendingCharacters.length} 位；已生成的草稿和已确认角色不会被覆盖。</p></div><button className="button primary" onClick={() => onGenerateAllCharacters(preset, feedback)} disabled={!!busy || pendingCharacters.length === 0}>{busy === "planning" ? "批量生成中…" : pendingCharacters.length ? `一键生成 ${pendingCharacters.length} 位小传` : "全部已有草稿"}</button></div><div className="toolbar-actions">{rosterList.map((item) => <button key={item.item_key} className={`button ${activeKey === item.item_key ? "primary" : ""}`} onClick={() => selectCharacter(item.item_key)}>{item.name || item.item_key}</button>)}</div></div>}
       {selectedStep === "arc" && <div className="planning-subitems"><strong>已生成卷级主线</strong><div className="toolbar-actions">{items.map((item) => <button key={item.item_key} className={`button ${activeKey === item.item_key ? "primary" : ""}`} onClick={() => selectArc(item.item_key)}>第{item.item_key.split(":")[1] || "?"}卷</button>)}<button className="button" onClick={() => { setSelectedItemKey(nextArcKey); }}>新增第{items.length + 1}卷</button></div></div>}
       {selectedStep === "contract" && candidateList.length > 0 && <div className="planning-candidates">{candidateList.map((candidate, index) => <div className="card planning-candidate" key={`${candidate.title || "candidate"}-${index}`}><div className="toolbar"><h3>{candidate.title || `方向 ${index + 1}`}</h3><button className="button primary" onClick={() => void selectContractCandidate(index)} disabled={!!busy || hasBlockingIssues}>选择并确认</button></div><p><strong>读者体验：</strong>{candidate.target_experience}</p><p><strong>主角原则：</strong>{candidate.protagonist_principle}</p><p><strong>成长与回报：</strong>{candidate.power_curve} · {candidate.payoff_cadence}</p><p><strong>边界：</strong>{candidate.moral_boundary}</p><p><strong>禁区：</strong>{(candidate.forbidden || []).join("；")}</p></div>)}</div>}
-      {selectedStep === "cast_roster" && activeItem?.content?.characters && <div className="planning-roster">{(activeItem.content.characters as Record<string, any>[]).map((item) => <div className="asset" key={item.item_key}><strong>{item.name}</strong><p>{item.role} · {item.story_function}</p><p>与主角：{item.relationship_to_protagonist}</p></div>)}</div>}
+      {selectedStep === "cast_roster" && Array.isArray(activeItem?.content?.characters) && <div className="planning-roster">{(activeItem.content.characters as PlanningRosterItem[]).map((item) => <div className="asset" key={item.item_key}><strong>{item.name}</strong><p>{item.role} · {item.story_function}</p><p>与主角：{item.relationship_to_protagonist}</p></div>)}</div>}
       {activeItem && <p className="muted">本步 token：{activeItem.total_tokens == null ? "未知" : `输入 ${activeItem.input_tokens || 0} · 输出 ${activeItem.output_tokens || 0} · 总计 ${activeItem.total_tokens}`}</p>}
       <PlanningFieldForm step={selectedStep} draftText={draftText} rules={planningRules} onChange={setDraftText} />
       <details className="field"><summary>高级编辑（JSON）</summary><textarea className="planning-editor" value={draftText} onChange={(event) => setDraftText(event.target.value)} placeholder="先生成当前步骤…" /></details>
@@ -905,7 +934,10 @@ function ModelSettings({ profiles, onChanged }: { profiles: ModelProfile[]; onCh
     const data = await api<{ codex_auth: { ok: boolean; message: string } }>("/model-profiles");
     setCodexStatus(data.codex_auth);
   }, []);
-  useEffect(() => { loadCodexStatus().catch(() => undefined); }, [loadCodexStatus]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => { loadCodexStatus().catch(() => undefined); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [loadCodexStatus]);
 
   async function refresh() {
     await onChanged();
@@ -971,9 +1003,9 @@ function ModelCalls() {
     api<{ items: Work[] }>("/works").then((data) => setWorks(data.items.map((item) => ({ id: item.id, title: item.title })))).catch(() => undefined);
   }, []);
   useEffect(() => {
-    void load();
+    const firstLoad = window.setTimeout(() => void load(), 0);
     const timer = window.setInterval(() => void load(), 5000);
-    return () => window.clearInterval(timer);
+    return () => { window.clearTimeout(firstLoad); window.clearInterval(timer); };
   }, [load]);
 
   async function openDetail(id: string) {
@@ -1037,7 +1069,10 @@ function PromptSettingsPanel() {
     setSelectedKey(key);
     setDraft(data.items.find((item) => item.key === key)?.content || "");
   }, []);
-  useEffect(() => { load().catch((e) => setMessage((e as Error).message)); }, [load]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => { load().catch((e) => setMessage((e as Error).message)); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [load]);
   function selectPrompt(item: PromptSetting) {
     if (dirty && !window.confirm("当前提示词尚未保存，确定切换吗？")) return;
     setSelectedKey(item.key); setDraft(item.content); setMessage("");
@@ -1074,7 +1109,10 @@ function ProxySettingsPanel() {
     const data = await api<ProxySettings>("/settings/proxy");
     setSettings(data); setEnabled(data.enabled); setPort(String(data.port));
   }, []);
-  useEffect(() => { load().catch((e) => setMessage((e as Error).message)); }, [load]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => { load().catch((e) => setMessage((e as Error).message)); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [load]);
   async function save(event: FormEvent) {
     event.preventDefault(); setBusy(true); setMessage("");
     try {
@@ -1102,10 +1140,10 @@ function Foreshadows({ work, onSaved }: { work: Work; onSaved: () => Promise<voi
 }
 
 function Trends({ profiles, onCreate }: { profiles: ModelProfile[]; onCreate: (work: Work) => void }) {
-  const [items, setItems] = useState<TrendItem[]>([]); const [selected, setSelected] = useState<string[]>([]); const [ideas, setIdeas] = useState<TrendIdea[]>([]); const [sourceModels, setSourceModels] = useState<TrendSourceModel[]>([]); const [analysisId, setAnalysisId] = useState(""); const [keyword, setKeyword] = useState(""); const [loading, setLoading] = useState(false); const [creatingIndex, setCreatingIndex] = useState<number | null>(null); const [message, setMessage] = useState("");
+  const [items, setItems] = useState<TrendItem[]>([]); const [selected, setSelected] = useState<string[]>([]); const [ideas, setIdeas] = useState<TrendIdea[]>([]); const [sourceModels, setSourceModels] = useState<TrendSourceModel[]>([]); const [keyword, setKeyword] = useState(""); const [loading, setLoading] = useState(false); const [creatingIndex, setCreatingIndex] = useState<number | null>(null); const [message, setMessage] = useState("");
   const usableProfiles = profiles.filter((profile) => profile.has_api_key || (profile.provider === "codex_auth" && profile.last_test_status === "ok"));
-  async function search(force = false) { setLoading(true); setMessage(""); setSelected([]); setIdeas([]); setSourceModels([]); setAnalysisId(""); try { const data = await api<{ items: TrendItem[]; sources: { source: string; stale?: boolean; error?: string }[] }>("/trends/search", { method: "POST", body: JSON.stringify({ sources: ["fanqie", "qidian", "jjwxc"], keyword, refresh: force }) }); setItems(data.items); setMessage(data.sources.map((source) => `${source.source}${source.stale ? "（离线缓存）" : ""}${source.error ? `：${source.error}` : ""}`).join(" · ")); } catch (e) { setMessage((e as Error).message); } finally { setLoading(false); } }
-  async function analyze() { if (!selected.length) return; setLoading(true); setMessage(""); try { const usable = usableProfiles.find((profile) => Boolean(profile.is_default)) || usableProfiles[0]; const data = await api<{ id: string; ideas: TrendIdea[]; source_models: TrendSourceModel[] }>("/trends/analyze", { method: "POST", body: JSON.stringify({ item_ids: selected, model_profile_id: usable?.id || null }) }); setIdeas(data.ideas); setSourceModels(data.source_models || []); setAnalysisId(data.id); } catch (e) { setMessage((e as Error).message); } finally { setLoading(false); } }
+  async function search(force = false) { setLoading(true); setMessage(""); setSelected([]); setIdeas([]); setSourceModels([]); try { const data = await api<{ items: TrendItem[]; sources: { source: string; stale?: boolean; error?: string }[] }>("/trends/search", { method: "POST", body: JSON.stringify({ sources: ["fanqie", "qidian", "jjwxc"], keyword, refresh: force }) }); setItems(data.items); setMessage(data.sources.map((source) => `${source.source}${source.stale ? "（离线缓存）" : ""}${source.error ? `：${source.error}` : ""}`).join(" · ")); } catch (e) { setMessage((e as Error).message); } finally { setLoading(false); } }
+  async function analyze() { if (!selected.length) return; setLoading(true); setMessage(""); try { const usable = usableProfiles.find((profile) => Boolean(profile.is_default)) || usableProfiles[0]; const data = await api<{ ideas: TrendIdea[]; source_models: TrendSourceModel[] }>("/trends/analyze", { method: "POST", body: JSON.stringify({ item_ids: selected, model_profile_id: usable?.id || null }) }); setIdeas(data.ideas); setSourceModels(data.source_models || []); } catch (e) { setMessage((e as Error).message); } finally { setLoading(false); } }
   async function createIdea(index: number) { const idea = ideas[index]; if (!idea?.blueprint_id) { setMessage("该创意缺少原创蓝图，请重新分析。"); return; } setCreatingIndex(index); try { const usable = usableProfiles.find((profile) => Boolean(profile.is_default)) || usableProfiles[0]; const work = await api<Work>("/works/from-inspiration-blueprint", { method: "POST", body: JSON.stringify({ blueprint_id: idea.blueprint_id, model_profile_id: usable?.id || null, idempotency_key: `blueprint-${idea.blueprint_id}` }) }); onCreate(work); } catch (e) { setMessage((e as Error).message); } finally { setCreatingIndex(null); } }
   const toggle = (id: string, checked: boolean) => setSelected((current) => checked ? [...current, id] : current.filter((value) => value !== id));
   return <div><div className="topbar"><div><div className="eyebrow">TREND → BLUEPRINT</div><h1>热门灵感</h1><p className="subtitle">从公开榜单提炼抽象作品模型，再生成带原创约束的故事档案蓝图；不抓取或保存小说全文。</p></div><div className="toolbar-actions"><button className="button" onClick={() => search(false)} disabled={loading}>{loading ? "读取中…" : "读取缓存"}</button><button className="button primary" onClick={() => search(true)} disabled={loading}>强制刷新</button></div></div><div className="card trend-search"><div className="field"><label>关键词</label><input value={keyword} onChange={(e) => setKeyword(e.target.value)} onKeyDown={(e) => e.key === "Enter" && void search(false)} placeholder="搜索书名、作者或题材" /></div><div className="toolbar"><span className="muted">步骤 1：选 1–5 本作品；步骤 2：提取抽象模型；步骤 3：选择原创蓝图并进入故事档案。</span><button className="button primary" onClick={() => void analyze()} disabled={!selected.length || loading || !usableProfiles.length}>提取 {selected.length} 本作品模型</button></div>{!usableProfiles.length && <p className="muted">趋势分析需要先到“模型服务”配置 API Key 或完成 Codex Auth 登录；榜单浏览不受影响。</p>}</div>{message && <div className="notice">{message}</div>}<div className="grid"><div className="card span-7"><h2>榜单作品</h2>{items.length ? <div className="trend-list">{items.map((item) => <label className={`trend-row ${selected.includes(item.id) ? "selected" : ""}`} key={item.id}><input type="checkbox" checked={selected.includes(item.id)} onChange={(e) => toggle(item.id, e.target.checked)} /><span className="rank">{item.rank}</span><span><strong>{item.title}</strong><small>{item.source} · {item.category || "综合"} · {item.metric_label} {item.metric_value}</small><em>{item.synopsis}</em></span><a href={item.source_url} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>来源</a></label>)}</div> : <p className="muted">先读取榜单，再选择需要建模的作品。</p>}</div><div className="card span-5"><h2>来源作品模型</h2>{sourceModels.length ? <div className="asset-list">{sourceModels.map((source) => <div className="asset" key={source.trend_item_id}><div className="toolbar"><strong>抽象作品模型</strong><span className="tag">信息完整度：{source.completeness}</span></div><p>{source.model.market_positioning || "仅根据公开条目提炼市场信号。"}</p><p>开篇/冲突：{source.model.narrative_engine?.opening || "待补充"}；{source.model.narrative_engine?.conflict || "待补充"}</p><p className="muted">可吸收：{(source.model.safe_signals || []).join("；") || "节奏与目标感"}</p></div>)}</div> : <p className="muted">完成分析后，这里只展示去实体化的叙事与连载规律。</p>}</div><div className="card span-12"><h2>原创故事蓝图</h2>{ideas.length ? <div className="blueprint-grid">{ideas.map((idea, index) => <div className="asset idea-card" key={`${idea.title}-${index}`}><div className="toolbar"><strong>{idea.title}</strong><button className="button primary" onClick={() => void createIdea(index)} disabled={creatingIndex !== null}>{creatingIndex === index ? "正在创建…" : "采用蓝图并创建作品"}</button></div><p>{idea.genre} · {idea.audience}</p><p><strong>新故事钩子：</strong>{idea.hook}</p><p>{idea.synopsis}</p><p className="muted">吸收：{(idea.blueprint?.market_signals || []).join("；") || "抽象市场信号"}</p><p className="muted">必须重构：{(idea.blueprint?.transformation_contract?.change || []).join("；")}</p><p className="muted">原创边界：{(idea.blueprint?.transformation_contract?.avoid || []).join("；") || idea.risk}</p></div>)}</div> : <p className="muted">作品模型完成后，这里会给出可直接进入故事档案向导的原创蓝图。</p>}</div></div></div>;
@@ -1150,7 +1188,10 @@ function OutlineV2({ work, busy, onSave, onGenerate, onGenerateVolume, onRefresh
   const [structureMessage, setStructureMessage] = useState("");
   const jsonText = (value: unknown) => JSON.stringify(value ?? (Array.isArray(value) ? [] : {}), null, 2);
   const parseJson = (value: string, fallback: unknown) => { try { return JSON.parse(value); } catch { return fallback; } };
-  useEffect(() => { setTotalTarget((value) => Math.max(value, targetFloor)); }, [targetFloor]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setTotalTarget((value) => Math.max(value, targetFloor)), 0);
+    return () => window.clearTimeout(timer);
+  }, [targetFloor]);
   const begin = (plan: ChapterPlan) => { setEditing(plan.chapter_no); setDraft({ ...plan, beats: [...(plan.beats || [])] }); };
   const save = async () => {
     if (!draft) return;
@@ -1274,24 +1315,6 @@ function OutlineV2({ work, busy, onSave, onGenerate, onGenerateVolume, onRefresh
       {context !== null && <details open><summary>实际正文上下文预览（未来信息及旧动态字段均带排除原因）</summary><pre>{JSON.stringify(context, null, 2)}</pre></details>}
     </div>
   </div>;
-}
-
-function Outline({ work, busy, onSave }: { work: Work; busy: string; onSave: (chapterNo: number, changes: Partial<ChapterPlan>) => Promise<void> }) {
-  const [editing, setEditing] = useState<number | null>(null);
-  const [draft, setDraft] = useState<ChapterPlan | null>(null);
-  function begin(item: ChapterPlan) { setEditing(item.chapter_no); setDraft({ ...item, beats: [...(item.beats || [])] }); }
-  async function save() {
-    if (!draft) return;
-    await onSave(draft.chapter_no, {
-      title: draft.title, goal: draft.goal, conflict: draft.conflict, hook: draft.hook,
-      beats: (draft.beats || []).filter(Boolean), story_day: draft.story_day ?? null,
-      phase_key: draft.phase_key || "", plot_arc: draft.plot_arc || "",
-      title_promise_progress: draft.title_promise_progress || "", character_arc_progress: draft.character_arc_progress || "",
-    });
-    setEditing(null); setDraft(null);
-  }
-  const phaseLabel = (key?: string) => work.story_phases?.find((phase) => phase.phase_key === key)?.name || key;
-  return <div className="grid"><div className="card span-8"><div className="toolbar"><div><h2>章节大纲</h2><p className="subtitle">作者可以逐章修订；保存后正文与后续承接会自动标记复核。</p></div><span className="tag">{work.chapter_plans?.length || 0} 章</span></div>{work.chapter_plans?.length ? <div className="outline">{work.chapter_plans.map((item) => <div className="outline-item" key={item.chapter_no}>{editing === item.chapter_no && draft ? <div className="field"><label>章节标题</label><input value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} /><div className="two-col"><div><label>故事日</label><input type="number" value={draft.story_day ?? ""} onChange={(event) => setDraft({ ...draft, story_day: event.target.value === "" ? null : Number(event.target.value) })} /></div><div><label>阶段</label><select value={draft.phase_key || ""} onChange={(event) => setDraft({ ...draft, phase_key: event.target.value })}><option value="">未设</option>{(work.story_phases || []).map((phase) => <option key={phase.phase_key} value={phase.phase_key}>{phase.name}</option>)}</select></div></div><label>目标</label><textarea value={draft.goal} onChange={(event) => setDraft({ ...draft, goal: event.target.value })} /><label>冲突</label><textarea value={draft.conflict} onChange={(event) => setDraft({ ...draft, conflict: event.target.value })} /><label>情节点（每行一项）</label><textarea value={(draft.beats || []).join("\n")} onChange={(event) => setDraft({ ...draft, beats: event.target.value.split("\n") })} /><label>结尾钩子</label><textarea value={draft.hook} onChange={(event) => setDraft({ ...draft, hook: event.target.value })} /><div className="toolbar-actions"><button className="button primary" onClick={save} disabled={!!busy}>{busy === "outline-save" ? "保存中…" : "保存大纲"}</button><button className="button" onClick={() => { setEditing(null); setDraft(null); }} disabled={!!busy}>取消</button></div></div> : <><div className="toolbar"><strong>第{item.chapter_no}章 · {item.title}</strong><button className="button" onClick={() => begin(item)} disabled={!!busy}>编辑</button></div>{item.stale_reason && <p className="notice">需复核：{item.stale_reason}</p>}{item.story_day !== null && item.story_day !== undefined && <p className="muted">故事日：{item.story_day} {item.phase_key ? `· ${phaseLabel(item.phase_key)}` : ""}</p>}{item.plot_arc && <p className="muted">所属主线：{item.plot_arc}</p>}<p>目标：{item.goal}</p><p>冲突：{item.conflict}</p><p>钩子：{item.hook}</p>{item.title_promise_progress && <p>书名兑现：{item.title_promise_progress}</p>}{item.character_arc_progress && <p>人物弧：{item.character_arc_progress}</p>}</>}</div>)}</div> : <p className="muted">还没有章节大纲，请先生成完整故事方案。</p>}</div><div className="card span-4"><h3>故事状态</h3><p className="muted">阶段 {work.story_phases?.length || 0} 个 · 势力 {work.factions?.length || 0} 个 · 任务 {work.goals?.length || 0} 项</p>{(work.story_phases || []).map((phase) => <div className="outline-item" key={phase.phase_key}><strong>{phase.name}</strong><p>故事日：{phase.start_day ?? "—"} 至 {phase.end_day ?? "—"}</p></div>)}{work.plot_arcs?.length ? <><h3>故事主线</h3><div className="outline">{work.plot_arcs.map((arc) => <div className="outline-item" key={arc.id}><strong>{arc.title}</strong><p>{arc.synopsis}</p></div>)}</div></> : <p className="muted">先生成故事方案。</p>}</div></div>;
 }
 
 function StoryStateV2({ work, onChanged }: { work: Work; onChanged: () => Promise<void> }) {
