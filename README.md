@@ -25,6 +25,11 @@ WeDream-Setup-0.2.5-x64.exe
 - `Source code (zip)` / `Source code (tar.gz)`：源代码压缩包，需要自行配置开发环境。
 
 安装版目前面向 Windows 10/11 x64。安装并启动“织梦台”后，在“模型设置”中配置模型服务即可使用；安装包不包含任何 API Key。
+<img width="2523" height="1098" alt="bce52e3f-454e-4d61-9dd9-8a9e8915788e" src="https://github.com/user-attachments/assets/396ce41e-5bc8-4508-bfcf-0418e0324727" />
+<img width="2493" height="1109" alt="3ffca8c1-bf87-4d7c-bf27-12644447fd9f" src="https://github.com/user-attachments/assets/bcf0f9f4-64f5-48ba-b3a5-ab2c56018688" />
+<img width="2442" height="1089" alt="a38bb7aa-fe5d-4d5d-a80b-47f5bf172bb3" src="https://github.com/user-attachments/assets/c6f379d2-953f-4a92-a9ea-10ba63b32533" />
+<img width="2484" height="1137" alt="25fefbe9-3333-402f-b566-1d607d2c72c6" src="https://github.com/user-attachments/assets/21cd01b7-6393-4baf-8ec1-45b9d25653d4" />
+<img width="2484" height="1232" alt="318a3c8e-cb80-48ab-affc-a3a70df57700" src="https://github.com/user-attachments/assets/2e20da0c-e269-4e6c-b559-c45024737d08" />
 
 ## 当前可以做什么
 
