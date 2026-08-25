@@ -37,8 +37,25 @@ jobs:
       - name: Install desktop dependencies
         run: npm ci
         working-directory: desktop
-      - name: Publish Windows installer and update metadata
+      - name: Build Windows installer and update metadata
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./scripts/build-windows.ps1 -Publish
+        run: ./scripts/build-windows.ps1
+      - name: Verify release artifacts
+        shell: pwsh
+        run: |
+          $version = (Get-Content desktop/package.json -Raw | ConvertFrom-Json).version
+          $installer = Get-Item "desktop/dist/WeDream-Setup-$version-x64.exe"
+          $blockmap = Get-Item "desktop/dist/WeDream-Setup-$version-x64.exe.blockmap"
+          $metadata = Get-Item desktop/dist/latest.yml
+          if ($installer.Length -lt 1MB) { throw "Windows installer is unexpectedly small" }
+          Write-Output "Installer: $($installer.FullName) ($([math]::Round($installer.Length / 1MB, 2)) MB)"
+          Write-Output "Blockmap: $($blockmap.FullName)"
+          Write-Output "Metadata: $($metadata.FullName)"
+      - name: Upload Windows installer to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            desktop/dist/WeDream-Setup-*.exe
+            desktop/dist/WeDream-Setup-*.exe.blockmap
+            desktop/dist/latest.yml
+          fail_on_unmatched_files: true
